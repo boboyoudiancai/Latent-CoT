@@ -1,0 +1,140 @@
+/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/albumentations/__init__.py:13: UserWarning: A new version of Albumentations is available: 2.0.8 (you have 1.4.18). Upgrade using: pip install -U albumentations. To disable automatic update checks, set the environment variable NO_ALBUMENTATIONS_UPDATE to 1.
+  check_for_updates()
+05/21 [04:31:39] INFO     | >>  Loaded mixtures from Behavior    registry.py:110
+                          (data_config): ['BEHAVIOR_challenge']                 
+                 INFO     | >>  Loaded data_config from DOMINO:  registry.py:104
+                          ['robotwin']                                          
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          DOMINO (data_config): []                              
+                 INFO     | >>  Loaded mixtures from DOMINO      registry.py:110
+                          (data_config): ['domino',                             
+                          'domino_clean', 'domino_random',                      
+                          'domino_cotrain']                                     
+                 INFO     | >>  Loaded data_config from Franka:  registry.py:104
+                          ['custom_robot_config',                               
+                          'demo_sim_franka_delta_joints',                       
+                          'SO101']                                              
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Franka (data_config): []                              
+                 INFO     | >>  Loaded mixtures from Franka      registry.py:110
+                          (data_config): ['custom_dataset',                     
+                          'custom_dataset_2',                                   
+                          'demo_sim_pick_place', 'SO101_pick']                  
+                 INFO     | >>  Loaded data_config from LIBERO:  registry.py:104
+                          ['libero_franka']                                     
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          LIBERO (data_config): []                              
+                 INFO     | >>  Loaded mixtures from LIBERO      registry.py:110
+                          (data_config): ['libero_all',                         
+                          'libero_goal', 'multi_robot']                         
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          RoboChallenge_table30v2:                              
+                          ['ur5_robochallenge',                                 
+                          'arx5_robochallenge',                                 
+                          'dosw1_robochallenge']                                
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          RoboChallenge_table30v2 (data_config):                
+                          ['ur5_robochallenge',                                 
+                          'arx5_robochallenge',                                 
+                          'dosw1_robochallenge']                                
+                 INFO     | >>  Loaded mixtures from             registry.py:110
+                          RoboChallenge_table30v2 (data_config):                
+                          ['robochallenge_table30v2_shred_paper'                
+                          , 'robochallenge_table30v2_ur5_all',                  
+                          'robochallenge_table30v2_arx5_all',                   
+                          'robochallenge_table30v2_dosw1_all']                  
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          Robocasa_365:                                         
+                          ['panda_omron_robocasa365']                           
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Robocasa_365 (data_config): []                        
+                 INFO     | >>  Loaded mixtures from             registry.py:110
+                          Robocasa_365 (data_config):                           
+                          ['robocasa365_open_drawer_target_human                
+                          ',                                                    
+                          'robocasa365_atomic_target_human_all',                
+                          'robocasa365_composite_target_human_al                
+                          l', 'robocasa365_target_human_all']                   
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          Robocasa_tabletop:                                    
+                          ['fourier_gr1_arms_waist']                            
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Robocasa_tabletop (data_config): []                   
+                 INFO     | >>  Loaded mixtures from             registry.py:110
+                          Robocasa_tabletop (data_config):                      
+                          ['fourier_gr1_unified_1000']                          
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          Robotwin: ['robotwin', 'robotwin50',                  
+                          'arx_x5']                                             
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          Robotwin (data_config): []                            
+                 INFO     | >>  Loaded mixtures from Robotwin    registry.py:110
+                          (data_config): ['robotwin_all',                       
+                          'robotwin_all_50', 'robotwin',                        
+                          'robotwin_task1', 'robotwin_task2',                   
+                          'arx_x5']                                             
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          SimplerEnv: ['oxe_droid',                             
+                          'oxe_bridge', 'oxe_rt1']                              
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          SimplerEnv (data_config): []                          
+                 INFO     | >>  Loaded mixtures from SimplerEnv  registry.py:110
+                          (data_config): ['bridge',                             
+                          'bridge_rt_1']                                        
+                 INFO     | >>  Loaded data_config from          registry.py:104
+                          VLA-Arena: ['vla_arena_franka']                       
+                 INFO     | >>  Loaded embodiment_tags from      registry.py:107
+                          VLA-Arena (data_config): []                           
+                 INFO     | >>  Loaded mixtures from VLA-Arena   registry.py:110
+                          (data_config): ['vla_arena_L0_S',                     
+                          'vla_arena_L0_M', 'vla_arena_L0_L']                   
+INFO:root:PolicyServerWrapper: loading framework from /home/liuyue/starVLA/playground/Checkpoints/QwenOFT_Libero_Qwen3-4B/checkpoints/steps_30000_pytorch_model.pt
+INFO:starVLA.model.framework.share_tools:[*] Loading from local checkpoint path `/home/liuyue/starVLA/playground/Checkpoints/QwenOFT_Libero_Qwen3-4B/checkpoints/steps_30000_pytorch_model.pt`
+INFO:starVLA.model.framework.share_tools:[*] [apply_config_compat] normalised config from version_id=None to '0.21'
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:09<00:09,  9.13s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:14<00:00,  6.83s/it]Loading checkpoint shards: 100%|██████████| 2/2 [00:14<00:00,  7.18s/it]
+/home/liuyue/starVLA/starVLA/model/framework/base_framework.py:248: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")
+INFO:starVLA.model.framework.share_tools:[*] Loading from local checkpoint path `/home/liuyue/starVLA/playground/Checkpoints/QwenOFT_Libero_Qwen3-4B/checkpoints/steps_30000_pytorch_model.pt`
+INFO:starVLA.model.framework.share_tools:[*] [apply_config_compat] normalised config from version_id=None to '0.21'
+INFO:starVLA.model.framework.share_tools:[*] Loading from local checkpoint path `/home/liuyue/starVLA/playground/Checkpoints/QwenOFT_Libero_Qwen3-4B/checkpoints/steps_30000_pytorch_model.pt`
+INFO:starVLA.model.framework.share_tools:[*] [apply_config_compat] normalised config from version_id=None to '0.21'
+INFO:starVLA.model.framework.share_tools:[*] Loading from local checkpoint path `/home/liuyue/starVLA/playground/Checkpoints/QwenOFT_Libero_Qwen3-4B/checkpoints/steps_30000_pytorch_model.pt`
+INFO:starVLA.model.framework.share_tools:[*] [apply_config_compat] normalised config from version_id=None to '0.21'
+INFO:deployment.model_server.policy_norm_processor:PolicyNormProcessor ready: robot_type=libero_franka, unnorm_key=franka, action_keys=['action.x', 'action.y', 'action.z', 'action.roll', 'action.pitch', 'action.yaw', 'action.gripper'] (dims=[1, 1, 1, 1, 1, 1, 1]), state_keys=['state.x', 'state.y', 'state.z', 'state.roll', 'state.pitch', 'state.yaw', 'state.pad', 'state.gripper']
+INFO:root:PolicyServerWrapper ready: action_chunk_size=8, default_unnorm_key=franka, available_unnorm_keys=['franka'], action_keys=['action.x', 'action.y', 'action.z', 'action.roll', 'action.pitch', 'action.yaw', 'action.gripper'], state_keys=['state.x', 'state.y', 'state.z', 'state.roll', 'state.pitch', 'state.yaw', 'state.pad', 'state.gripper']
+INFO:root:Creating server (host: dsw-712058-54cc566cb8-7n2n4, ip: 22.25.176.255)
+INFO:starVLA.model.framework.share_tools:[*] Loading from local checkpoint path `/home/liuyue/starVLA/playground/Checkpoints/QwenOFT_Libero_Qwen3-4B/checkpoints/steps_30000_pytorch_model.pt`
+INFO:starVLA.model.framework.share_tools:[*] [apply_config_compat] normalised config from version_id=None to '0.21'
+INFO:deployment.model_server.policy_norm_processor:PolicyNormProcessor ready: robot_type=libero_franka, unnorm_key=franka, action_keys=['action.x', 'action.y', 'action.z', 'action.roll', 'action.pitch', 'action.yaw', 'action.gripper'] (dims=[1, 1, 1, 1, 1, 1, 1]), state_keys=['state.x', 'state.y', 'state.z', 'state.roll', 'state.pitch', 'state.yaw', 'state.pad', 'state.gripper']
+INFO:root:server running ... metadata={'env': 'starvla_policy_server', 'ckpt_path': '/home/liuyue/starVLA/playground/Checkpoints/QwenOFT_Libero_Qwen3-4B/checkpoints/steps_30000_pytorch_model.pt', 'action_chunk_size': 8, 'available_unnorm_keys': ['franka'], 'default_unnorm_key': 'franka', 'action_keys': ['action.x', 'action.y', 'action.z', 'action.roll', 'action.pitch', 'action.yaw', 'action.gripper'], 'state_keys': ['state.x', 'state.y', 'state.z', 'state.roll', 'state.pitch', 'state.yaw', 'state.pad', 'state.gripper']}
+INFO:websockets.server:server listening on 0.0.0.0:6696
+ERROR:websockets.server:opening handshake failed
+Traceback (most recent call last):
+  File "/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/websockets/http11.py", line 138, in parse
+    request_line = yield from parse_line(read_line)
+  File "/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/websockets/http11.py", line 320, in parse_line
+    line = yield from read_line(MAX_LINE_LENGTH)
+  File "/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/websockets/streams.py", line 46, in read_line
+    raise EOFError(f"stream ends after {p} bytes, before end of line")
+EOFError: stream ends after 0 bytes, before end of line
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/websockets/server.py", line 547, in parse
+    request = yield from Request.parse(
+  File "/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/websockets/http11.py", line 140, in parse
+    raise EOFError("connection closed while reading HTTP request line") from exc
+EOFError: connection closed while reading HTTP request line
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/websockets/asyncio/server.py", line 356, in conn_handler
+    await connection.handshake(
+  File "/home/liuyue/miniconda3/envs/starvla/lib/python3.10/site-packages/websockets/asyncio/server.py", line 207, in handshake
+    raise self.protocol.handshake_exc
+websockets.exceptions.InvalidMessage: did not receive a valid HTTP request
+INFO:websockets.server:connection open
+INFO:root:Connection from ('127.0.0.1', 33818) opened
+INFO:root:Connection from ('127.0.0.1', 33818) closed

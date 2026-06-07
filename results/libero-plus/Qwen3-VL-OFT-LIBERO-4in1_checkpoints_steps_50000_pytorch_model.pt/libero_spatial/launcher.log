@@ -1,0 +1,3 @@
+2026-05-21T13:48:22+00:00 launcher start suite=libero_spatial server_gpu=0 render_gpu=0 port=7694 ckpt=/home/liuyue/starVLA/playground/Checkpoints/Qwen3-VL-OFT-LIBERO-4in1/checkpoints/steps_50000_pytorch_model.pt out=/home/liuyue/starVLA/results/libero-plus/Qwen3-VL-OFT-LIBERO-4in1_checkpoints_steps_50000_pytorch_model.pt/libero_spatial
+2026-05-21T13:48:56+00:00 server ready suite=libero_spatial port=7694
+2026-05-22T22:55:41+00:00 eval exit suite=libero_spatial status=0

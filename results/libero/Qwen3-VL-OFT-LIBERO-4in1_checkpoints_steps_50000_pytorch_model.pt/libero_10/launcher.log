@@ -1,0 +1,3 @@
+2026-05-21T06:37:14+00:00 launcher start suite=libero_10 server_gpu=7 render_gpu=0 port=6701 ckpt=/home/liuyue/starVLA/playground/Checkpoints/Qwen3-VL-OFT-LIBERO-4in1/checkpoints/steps_50000_pytorch_model.pt out=/home/liuyue/starVLA/results/libero/Qwen3-VL-OFT-LIBERO-4in1_checkpoints_steps_50000_pytorch_model.pt/libero_10
+2026-05-21T06:38:43+00:00 server ready suite=libero_10 port=6701
+2026-05-21T13:10:01+00:00 eval exit suite=libero_10 status=0

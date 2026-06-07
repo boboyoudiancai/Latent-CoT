@@ -1,0 +1,3 @@
+launcher.log -> /home/liuyue/starVLA/.eval4_logs/libero/QwenOFT_Libero_Qwen3-4B_checkpoints_steps_30000_pytorch_model.pt/libero_object/launcher.log
+server.log -> /home/liuyue/starVLA/.eval4_logs/libero/QwenOFT_Libero_Qwen3-4B_checkpoints_steps_30000_pytorch_model.pt/libero_object/server.log
+eval.log -> /home/liuyue/starVLA/.eval4_logs/libero/QwenOFT_Libero_Qwen3-4B_checkpoints_steps_30000_pytorch_model.pt/libero_object/eval.log

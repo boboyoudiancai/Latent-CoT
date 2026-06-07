@@ -1,0 +1,22 @@
+{
+    "exclude": [
+       "**/__pycache__",
+      "checkpoints",
+      "results",
+      ".vscode",
+      ".git",
+      "playground",
+      "scripts/debug",
+      "eval/debug_logs",
+      "playground",
+      "LaRA_VLA.egg-info",
+      "cogact.egg-info",
+      "eval",
+      "example",
+      "deployment"
+    ],
+    "typeCheckingMode": "off",
+    "remote.downloadExtensionsLocally": true,
+    "workbench.web.useServiceWorkers": false
+  }
+  

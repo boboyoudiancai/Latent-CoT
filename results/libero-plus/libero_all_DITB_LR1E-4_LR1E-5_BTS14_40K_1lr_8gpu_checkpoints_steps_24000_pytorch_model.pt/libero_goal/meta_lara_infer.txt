@@ -1,0 +1,15 @@
+model_label=trained
+ckpt=/home/liuyue/starVLA/playground/Checkpoints/LiberoECOT_final_8gpu/libero_all_DITB_LR1E-4_LR1E-5_BTS14_40K_1lr_8gpu/checkpoints/steps_24000_pytorch_model.pt
+suite=libero_goal
+server_gpu=6
+render_gpu=0
+port=12302
+num_trials_per_task=1
+seed=7
+server_repo=/home/liuyue/LaRA-VLA
+server_entry=deployment/model_server/server_policy.py
+eval_entry=/home/liuyue/LaRA-VLA/examples/LIBERO-plus/eval_files/eval_lara_plus.py
+enable_latent_reasoning=true
+cot_mode=implicit
+thinking_token_count=default_3
+img_next_count=default_16

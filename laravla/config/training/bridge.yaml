@@ -1,0 +1,163 @@
+# ============================================================================
+# Bridge-LeRobot :: ECoT Stage-2 Training Configuration
+# ============================================================================
+#  - Dataloader: `lerobot_datasets` (BRIDGE mix)
+#  - Formatter: BridgeReasoningFormatter stage=2 (subtask latent)
+#  - Trainer : train_ecot.py (latent reasoning enabled)
+# ============================================================================
+
+run_id: "bridge_ecot_stage2"
+run_root_dir: "results/BridgeECOT"
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: "your_wandb_entity"
+wandb_project: "bridge_ecot"
+is_debug: false
+
+datasets:
+  vla_data:
+    dataset_py: "lerobot_datasets"
+    data_root_dir: "/share/project/baishuanghao/data"
+    data_mix: "bridge_local"
+    per_device_batch_size: 8
+    image_size: [224, 224]
+    delete_pause_frame: true
+    obs: ["image_0"]
+    default_image_resolution: [3, 224, 224]
+    bridge_annotations:
+      cot_path: "/share/project/baishuanghao/data/bridge_orig_lerobot/annotations/episode_dense_captions_full_final.jsonl"
+      bbox_path: "/share/project/baishuanghao/data/bridge_orig_lerobot/annotations/episode_sam3_bboxes_final_merged.jsonl"
+      fast_tokenizer_name: "physical-intelligence/fast"
+      steps_cache_path: "/share/project/baishuanghao/data/bridge_orig_lerobot/meta/steps_d73aaaf2328a.pkl"
+      filters:
+        require_cot_episode: false
+        require_bbox_episode: true
+        min_episode_bbox_coverage: 0.0
+        require_bbox_step: false
+        include_task_indices: null  # e.g., [1, 2, 3]
+        exclude_task_indices: [4,11,338,1176,3656,3922,4446,4865,6552,9814,11386,11704,12032,12708,13667,15039,16104,16392,16914,17286,18937]   # e.g., [4]
+    bridge_reasoning:
+      enable: true
+      stage: 4          # Stage 2: subtask latent, reasoning/bbox still explicit
+      include_bbox: true
+      include_action_tokens: true
+      thinking_token: "<|thinking|>"
+      start_token: "<|start_of_thinking|>"
+      end_token: "<|end_of_thinking|>"
+      component_order: [BBOX, SUBTASK, REASON]
+      tag2think_count:
+        SUBTASK: 1
+        REASON: 1
+        BBOX: 1
+      vlm_loss_weight: 1
+    ecot:
+      scheduled_stage: 4   # for config validation logging
+
+framework:
+  name: "QwenGR00T"
+  training_stage: "full"
+  cot_mode: "implicit"          # 默认显式声明，运行时可被 COT_MODE 覆写
+  enable_latent_reasoning: true
+  emit_thinking_tokens: false   # 显式 CoT 关闭 latent 时仍不输出思维 token
+  latent_reasoning:
+    compute_language_loss: true
+    vlm_loss_weight: 1
+    thinking_token: "<|thinking|>"
+    start_of_thinking_token: "<|start_of_thinking|>"
+    end_of_thinking_token: "<|end_of_thinking|>"
+  # img_next 对齐配置
+  img_next:
+    enable: true
+    token: "<img_next>"
+    loss_weight: 0.1
+    res: 112  # 112x112 输入，经 2x2 merge 得 16 token
+    use_teacher: false
+  qwenvl:
+    base_vlm: "StarVLA/Qwen3-VL-4B-Instruct-Action"
+    attn_implementation: "sdpa"
+    cache_dir: "/share/project/lvjing/starVLA/qwen_cache"
+    model_max_length: 2048
+  action_model:
+    action_model_type: "DiT-B"
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 8
+    future_action_window_size: 15
+    action_horizon: 16
+    past_action_window_size: 0
+    repeated_diffusion_steps: 4
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    use_reasoning_summary: false
+    use_img_next_mlp_compress: false
+    reasoning_summary_tokens: 2
+    reasoning_summary_heads: 4
+    reasoning_summary_dropout: 0.1
+    use_reasoning_film: false
+    reasoning_film_first_k: 4        # 0 表示禁用；>0 表示前 K 层应用
+    reasoning_film_dropout: 0.1
+    reasoning_film_hidden: 1024      # FiLM MLP 中间维度（可与 DiT hidden 对齐）
+    diffusion_model_cfg:
+      cross_attention_dim: 1536
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+
+trainer:
+  max_train_steps: 20000
+  epochs: null
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  logging_frequency: 10
+  save_interval: 2000
+  eval_interval: 500
+  latent_analysis:
+    enable: false
+    interval_steps: 1
+    max_samples: 32
+    max_latents: 3
+    max_img_next: 32
+    # Dedupe: keep only unique instructions to reduce repeated samples.
+    # - unique_in_batch: ensures we don't log the same instruction twice within one trigger.
+    # - dedupe_across_run: ensures we don't keep logging an instruction we've already logged before.
+    unique_in_batch: true
+    dedupe_across_run: true
+    max_seen_instructions: 1000
+    # If true, log how many unique instructions have been saved so far.
+    log_saved_instruction_count: true
+    # If true, additionally dump thinking token vectors for PCA/UMAP and probing.
+    # The dump is one file per trigger under `${output_dir}/latent_analysis/${embeddings_subdir}/`.
+    dump_embeddings: false
+    # Optional: also dump <img_next> token vectors (size max_img_next x hidden).
+    dump_img_next_embeddings: false
+    # One of: float16 | bfloat16 | float32
+    embeddings_dtype: "float16"
+    embeddings_subdir: "embeddings"
+    dump_dir: null
+  warmup_ratio: 0.1
+  num_warmup_steps: 2000
+  learning_rate:
+    base: 3.0e-5
+    qwen_vl_interface: 1.0e-5
+    action_model: 1.0e-4
+  lr_scheduler_type: "cosine_with_min_lr"
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-7
+  optimizer:
+    name: "AdamW"
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 1.0e-8
+  freeze_modules: ""
+  enable_gradient_checkpointing: false
+  enable_mixed_precision_training: true

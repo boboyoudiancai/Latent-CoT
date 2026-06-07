@@ -1,0 +1,3 @@
+launcher_log=/home/liuyue/starVLA/.eval4_logs/libero-plus/final_model_QwenGR00T_pure_pytorch_model.pt/libero_spatial/launcher.log
+server_log=/home/liuyue/starVLA/.eval4_logs/libero-plus/final_model_QwenGR00T_pure_pytorch_model.pt/libero_spatial/server.log
+eval_log=/home/liuyue/starVLA/.eval4_logs/libero-plus/final_model_QwenGR00T_pure_pytorch_model.pt/libero_spatial/eval.log

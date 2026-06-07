@@ -1,0 +1,11 @@
+
+[dev]
+black>=24.2.0
+gpustat
+ipython
+pre-commit
+ruff>=0.2.2
+
+[sagemaker]
+boto3
+sagemaker

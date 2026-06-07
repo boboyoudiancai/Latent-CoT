@@ -1,0 +1,130 @@
+# ============================================================================
+# Libero-all :: Latent Reasoning Training
+# ============================================================================
+# Mix: libero_goal / libero_object / libero_spatial / libero_10
+# See: laravla/dataloader/gr00t_lerobot/mixtures.py
+# ============================================================================
+
+run_id: "libero_all"
+run_root_dir: "results/LiberoAll"
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: ""
+wandb_project: "libero_all"
+is_debug: false
+
+datasets:
+  vla_data:
+    dataset_py: "lerobot_datasets"
+    data_root_dir: "./data/libero_lerobot"
+    data_mix: "libero_all"
+    per_device_batch_size: 8
+    image_size: [224, 224]
+    delete_pause_frame: true
+    obs: ["image_0"]
+    default_image_resolution: [3, 224, 224]
+
+    bridge_annotations:
+      cot_path: "annotations/episode_dense_captions_full.jsonl"
+      bbox_path: "annotations/episode_sam3_bboxes_from_dino_final.jsonl"
+      fast_tokenizer_name: "physical-intelligence/fast"
+      steps_cache_path: null
+      write_steps_cache: true
+      filters:
+        require_cot_episode: false
+        require_bbox_episode: true
+        min_episode_bbox_coverage: 0.0
+        require_bbox_step: false
+        include_task_indices: null
+        exclude_task_indices: null
+
+    bridge_reasoning:
+      enable: true
+      stage: 2
+      include_bbox: true
+      include_action_tokens: true
+      include_img_next: true
+      thinking_token: "<|thinking|>"
+      start_token: "<|start_of_thinking|>"
+      end_token: "<|end_of_thinking|>"
+      component_order: [SUBTASK, BBOX, REASON]
+      tag2think_count:
+        SUBTASK: 1
+        REASON: 1
+        BBOX: 1
+
+framework:
+  name: "QwenGR00T"
+  training_stage: "action_only"
+  cot_mode: "implicit"
+  latent_reasoning:
+    compute_language_loss: true
+    vlm_loss_weight: 1
+
+  img_next:
+    enable: true
+    token: "<img_next>"
+    loss_weight: 0.1
+    res: 112
+    use_teacher: true
+
+  qwenvl:
+    base_vlm: "StarVLA/Qwen3-VL-4B-Instruct-Action"
+    attn_implementation: "sdpa"
+    cache_dir: "./qwen_cache"
+    model_max_length: 2048
+
+  action_model:
+    action_model_type: "DiT-B"
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 7
+    state_dim: 7
+    future_action_window_size: 7
+    action_horizon: 8
+    past_action_window_size: 0
+    repeated_diffusion_steps: 4
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 4
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 1536
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: "ada_norm"
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+
+trainer:
+  pretrained_checkpoint: null
+  reload_modules: null
+  max_train_steps: 60000
+  epochs: null
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  logging_frequency: 10
+  save_interval: 5000
+  eval_interval: 2000
+  warmup_ratio: 0.1
+  num_warmup_steps: 5000
+  learning_rate:
+    base: 3.0e-5
+    qwen_vl_interface: 1.0e-5
+    action_model: 1.0e-4
+  lr_scheduler_type: "cosine_with_min_lr"
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-7
+  optimizer:
+    name: "AdamW"
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+    weight_decay: 1.0e-8
+  freeze_modules: ""
+  enable_gradient_checkpointing: false
+  enable_mixed_precision_training: true

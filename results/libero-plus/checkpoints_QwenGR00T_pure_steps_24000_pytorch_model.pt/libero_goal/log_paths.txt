@@ -1,0 +1,3 @@
+launcher_log=/home/liuyue/starVLA/.eval4_logs/libero-plus/checkpoints_QwenGR00T_pure_steps_24000_pytorch_model.pt/libero_goal/launcher.log
+server_log=/home/liuyue/starVLA/.eval4_logs/libero-plus/checkpoints_QwenGR00T_pure_steps_24000_pytorch_model.pt/libero_goal/server.log
+eval_log=/home/liuyue/starVLA/.eval4_logs/libero-plus/checkpoints_QwenGR00T_pure_steps_24000_pytorch_model.pt/libero_goal/eval.log

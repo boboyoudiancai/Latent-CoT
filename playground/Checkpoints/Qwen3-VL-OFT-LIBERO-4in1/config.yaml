@@ -1,0 +1,48 @@
+datasets:
+  vla_data:
+    CoT_prompt: Your task is {instruction}. To identify the key objects for your task.
+      Locate their bounding boxes in [x1,y1,x2,y2] format.
+    data_mix: libero_all
+    data_root_dir: playground/Datasets/LEROBOT_LIBERO_DATA
+    dataset_py: lerobot_datasets
+    per_device_batch_size: 16
+    video_backend: torchvision_av
+framework:
+  action_model:
+    action_dim: 7
+    action_hidden_dim: 2560
+    action_model_type: DiT-B
+    future_action_window_size: 7
+    past_action_window_size: 0
+  name: QwenOFT
+  qwenvl:
+    base_vlm: playground/Pretrained_models/Qwen3-VL-4B-Instruct
+output_dir: ./results/Checkpoints/1226_libero4in1_qwen3oft
+run_id: 1226_libero4in1_qwen3oft
+run_root_dir: ./results/Checkpoints
+seed: 42
+trainer:
+  eval_interval: 100
+  freeze_modules: true
+  gradient_accumulation_steps: 1
+  gradient_clipping: 1.0
+  is_resume: true
+  learning_rate:
+    action_model: 0.0001
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+  logging_frequency: 100
+  lr_scheduler_type: cosine_with_min_lr
+  max_train_steps: 80000
+  num_warmup_steps: 5000
+  optimizer:
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  save_interval: 10000
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+wandb_entity: jinhuiye
+wandb_project: starVLA_Libero
