@@ -172,6 +172,7 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+wandb/
 playground/Models
 =4.43.2
 
@@ -181,6 +182,13 @@ playground/BuildData
 playground/Checkpoints
 playground/Pretrained_models
 playground/Datasets
+
+# Large model artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
 
 eval/SimplerEnv
 
@@ -218,63 +226,6 @@ experiments/libero/logs/2025-08-10/17-18-26+checkpoints_steps_60000_pytorch_mode
 **/*.log
 
 **/*.jpg
-
-# Repository snapshot exceptions for Latent-CoT.
-# Keep code/assets plus small run metadata, while excluding datasets, models,
-# checkpoint weights, videos, and binary caches.
-!assets/
-!assets/**/*.png
-!assets/**/*.jpg
-!assets/**/*.jpeg
-
-!LaRA_VLA.egg-info/
-!LaRA_VLA.egg-info/**
-
-!data/
-!data/README.md
-!data/libero_lerobot
-
-!playground/
-!playground/README.md
-!playground/Checkpoints/
-!playground/Checkpoints/**/
-!playground/Checkpoints/**/*.yaml
-!playground/Checkpoints/**/*.yml
-!playground/Checkpoints/**/*.json
-!playground/Checkpoints/**/*.jsonl
-!playground/Checkpoints/**/*.txt
-!playground/Checkpoints/**/*.md
-!playground/Checkpoints/**/*.sh
-!playground/Pretrained_models/
-!playground/Pretrained_models/README.md
-
-!results/
-!results/**/
-!results/**/*.log
-!results/**/*.json
-!results/**/*.jsonl
-!results/**/*.txt
-!results/**/*.csv
-!results/**/*.yaml
-!results/**/*.yml
-
-*.pt
-*.pth
-*.ckpt
-*.safetensors
-*.bin
-*.onnx
-*.msgpack
-*.pkl
-*.pickle
-*.npy
-*.npz
-*.wandb
-*.mp4
-*.mov
-*.avi
-*.mkv
-*.webm
 debug_images/step1_raw.npy
 test_image.jpg
 test_image.jpg.npy
@@ -292,42 +243,3 @@ starVLA/model/modules/sam_model/*
 assets/SAMv2.txt
 playground/*
 qwen_talk.md
-
-# Final snapshot overrides. These must stay at the end because the original
-# ignore file has broad patterns such as `playground/*`, `results`, `*.pt`,
-# `**/*.log`, and `**/*.png`.
-!assets/
-!assets/**/*.png
-!assets/**/*.jpg
-!assets/**/*.jpeg
-
-!LaRA_VLA.egg-info/
-!LaRA_VLA.egg-info/**
-
-!data/
-!data/README.md
-!data/libero_lerobot
-
-!playground/
-!playground/README.md
-!playground/Checkpoints/
-!playground/Checkpoints/**/
-!playground/Checkpoints/**/*.yaml
-!playground/Checkpoints/**/*.yml
-!playground/Checkpoints/**/*.json
-!playground/Checkpoints/**/*.jsonl
-!playground/Checkpoints/**/*.txt
-!playground/Checkpoints/**/*.md
-!playground/Checkpoints/**/*.sh
-!playground/Pretrained_models/
-!playground/Pretrained_models/README.md
-
-!results/
-!results/**/
-!results/**/*.log
-!results/**/*.json
-!results/**/*.jsonl
-!results/**/*.txt
-!results/**/*.csv
-!results/**/*.yaml
-!results/**/*.yml

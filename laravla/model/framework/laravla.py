@@ -164,6 +164,15 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
                 vlm_loss = qwenvl_outputs.loss if hasattr(qwenvl_outputs, 'loss') else None
 
+        explicit_cot_cfg = self.config.framework.get("explicit_cot", {})
+        action_context_max_tokens = int(explicit_cot_cfg.get("action_context_max_tokens", 0) or 0)
+        if action_context_max_tokens > 0:
+            last_hidden = self._limit_action_context(
+                last_hidden=last_hidden,
+                attention_mask=qwen_inputs.get("attention_mask"),
+                max_tokens=action_context_max_tokens,
+            )
+
         # Step 3: Compute losses based on training stage
         result = {}
 
@@ -439,6 +448,34 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         l1 = (l1 * mask_full).sum() / mask_full.sum()
         return l1
 
+    def _limit_action_context(
+        self,
+        last_hidden: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        max_tokens: int,
+    ) -> torch.Tensor:
+        if max_tokens <= 0 or last_hidden.shape[1] <= max_tokens:
+            return last_hidden
+
+        if attention_mask is None or attention_mask.shape[:2] != last_hidden.shape[:2]:
+            return last_hidden[:, :max_tokens, :]
+
+        mask = attention_mask.to(device=last_hidden.device, dtype=torch.bool)
+        selected = []
+        head_tokens = max_tokens // 2
+        tail_tokens = max_tokens - head_tokens
+        for sample_hidden, sample_mask in zip(last_hidden, mask):
+            valid_hidden = sample_hidden[sample_mask]
+            if valid_hidden.shape[0] > max_tokens:
+                valid_hidden = torch.cat(
+                    [valid_hidden[:head_tokens], valid_hidden[-tail_tokens:]],
+                    dim=0,
+                )
+            if valid_hidden.shape[0] < max_tokens:
+                valid_hidden = F.pad(valid_hidden, (0, 0, 0, max_tokens - valid_hidden.shape[0]))
+            selected.append(valid_hidden)
+        return torch.stack(selected, dim=0)
+
     def _generate_explicit_cot(
         self,
         batch_images: List[List[Image.Image]],
@@ -466,8 +503,9 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         finally:
             processor.tokenizer.padding_side = old_padding_side
 
-        max_new_tokens = int(kwargs.get("cot_max_new_tokens", 192))
-        do_sample = bool(kwargs.get("cot_do_sample", False))
+        explicit_cot_cfg = self.config.framework.get("explicit_cot", {})
+        max_new_tokens = int(kwargs.get("cot_max_new_tokens", explicit_cot_cfg.get("max_new_tokens", 192)))
+        do_sample = bool(kwargs.get("cot_do_sample", explicit_cot_cfg.get("do_sample", False)))
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
             "do_sample": do_sample,

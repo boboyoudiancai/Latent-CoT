@@ -11,6 +11,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12}"
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export TOKENIZERS_PARALLELISM=false
 
@@ -28,6 +29,8 @@ FAST_TOKENIZER="${FAST_TOKENIZER:-/home/liuyue/starVLA/playground/Pretrained_mod
 VLM_STEPS="${VLM_STEPS:-8000}"
 ACTION_STEPS="${ACTION_STEPS:-40000}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-14}"
+EXPLICIT_COT_MAX_NEW_TOKENS="${EXPLICIT_COT_MAX_NEW_TOKENS:-128}"
+ACTION_CONTEXT_MAX_TOKENS="${ACTION_CONTEXT_MAX_TOKENS:-320}"
 
 COMMON_ARGS=(
   --config_yaml laravla/config/training/libero.yaml
@@ -88,6 +91,8 @@ torchrun \
   --wandb_project explicit_cot_libero \
   --framework.training_stage full \
   --framework.explicit_cot.action_input generated \
+  --framework.explicit_cot.max_new_tokens "${EXPLICIT_COT_MAX_NEW_TOKENS}" \
+  --framework.explicit_cot.action_context_max_tokens "${ACTION_CONTEXT_MAX_TOKENS}" \
   --framework.latent_reasoning.vlm_loss_weight 0 \
   --trainer.pretrained_checkpoint "${VLM_FINAL}" \
   --trainer.reload_modules qwen_vl_interface \

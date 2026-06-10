@@ -97,6 +97,8 @@ framework:
       positional_embeddings: null
   explicit_cot:
     action_input: generated
+    max_new_tokens: 128
+    action_context_max_tokens: 320
   enable_latent_reasoning: false
   emit_thinking_tokens: true
   cot_mode_flags:
