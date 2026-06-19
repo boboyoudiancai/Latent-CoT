@@ -16,7 +16,7 @@ starvla_torch_site = os.environ.get("STARVLA_TORCH_SITE")
 if starvla_torch_site and starvla_torch_site not in sys.path:
     sys.path.append(starvla_torch_site)
 
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 
 import imageio
 import numpy as np
