@@ -84,6 +84,10 @@ def _parse_csv_arg(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _format_csv_arg(items: Sequence[object]) -> str:
+    return ",".join(str(item) for item in items)
+
+
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
 
@@ -206,6 +210,75 @@ def _resolve_server_gpus(server_gpus: str) -> List[str]:
         return _parse_csv_arg(server_gpus)
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     return _parse_csv_arg(visible)
+
+
+def _detect_idle_gpu_ids(max_utilization: int, max_memory_mb: int) -> List[str]:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+    except Exception as exc:
+        logging.warning("Auto parallel GPU detection failed: %s", exc)
+        return []
+
+    gpu_ids = []
+    for raw_line in output.splitlines():
+        parts = [item.strip() for item in raw_line.split(",")]
+        if len(parts) != 4:
+            continue
+        gpu_id, util, used_mem, _total_mem = parts
+        try:
+            util_value = int(util)
+            used_mem_value = int(used_mem)
+        except ValueError:
+            continue
+        if util_value <= max_utilization and used_mem_value <= max_memory_mb:
+            gpu_ids.append(gpu_id)
+    return gpu_ids
+
+
+def _auto_configure_parallelism(args, total_episodes: int) -> None:
+    if not args.auto_parallel:
+        return
+
+    if args.hosts or args.ports or args.server_gpus or args.render_gpu_ids or args.num_processes > 0:
+        logging.info("Auto parallel skipped because manual parallel parameters are already provided.")
+        return
+
+    gpu_ids = _detect_idle_gpu_ids(args.auto_gpu_max_utilization, args.auto_gpu_max_memory_mb)
+    if not gpu_ids:
+        logging.info("Auto parallel found no idle GPUs; keeping sequential/single-endpoint settings.")
+        return
+
+    if args.auto_max_endpoints > 0:
+        gpu_ids = gpu_ids[: args.auto_max_endpoints]
+
+    endpoint_count = min(len(gpu_ids), max(1, total_episodes))
+    if endpoint_count <= 1:
+        logging.info("Auto parallel found only one usable endpoint; keeping sequential/single-endpoint settings.")
+        return
+
+    gpu_ids = gpu_ids[:endpoint_count]
+    args.launch_servers = True
+    args.server_gpus = _format_csv_arg(gpu_ids)
+    args.render_gpu_ids = _format_csv_arg(gpu_ids)
+    args.ports = _format_csv_arg(args.port + idx for idx in range(endpoint_count))
+    args.hosts = _format_csv_arg([args.host] * endpoint_count)
+    args.num_processes = endpoint_count
+
+    cpu_count = os.cpu_count() or endpoint_count
+    logging.info(
+        "Auto parallel selected %d endpoints on GPUs=%s (cpu_count=%s, total_episodes=%d)",
+        endpoint_count,
+        gpu_ids,
+        cpu_count,
+        total_episodes,
+    )
 
 
 def _resolve_endpoints(args) -> List[Tuple[str, int]]:
@@ -642,6 +715,10 @@ def _build_argparser():
     p.add_argument("--server-log-path", default="")
     p.add_argument("--server-timeout", type=int, default=600)
     p.add_argument("--server-use-bf16", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--auto-parallel", action="store_true")
+    p.add_argument("--auto-gpu-max-utilization", type=int, default=10)
+    p.add_argument("--auto-gpu-max-memory-mb", type=int, default=2048)
+    p.add_argument("--auto-max-endpoints", type=int, default=0)
     return p
 
 
@@ -664,6 +741,8 @@ def main():
 
     task_suite = benchmark.get_benchmark_dict()[args.task_suite_name]()
     num_tasks = task_suite.n_tasks if args.max_tasks <= 0 else min(args.max_tasks, task_suite.n_tasks)
+    total_episodes = num_tasks * args.num_trials_per_task
+    _auto_configure_parallelism(args, total_episodes)
     endpoints = _resolve_endpoints(args)
     render_gpu_ids = _resolve_render_gpu_ids(args.render_gpu_ids, len(endpoints))
 
