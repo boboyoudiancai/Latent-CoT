@@ -423,6 +423,9 @@ def _worker_main(
     args_dict: Dict,
     endpoint: Tuple[str, int],
     render_gpu_id: Optional[str],
+    completed_counter,
+    total_episodes: int,
+    run_started_at: float,
     result_queue,
 ) -> None:
     try:
@@ -447,7 +450,9 @@ def _worker_main(
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
             env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args_dict["seed"])
-            logger.info("%s task=%d episode=%d start", log_prefix, task_id, episode_idx)
+            start_message = f"{log_prefix} task={task_id} episode={episode_idx} start"
+            logger.info(start_message)
+            print(start_message, flush=True)
             t0 = time.perf_counter()
             try:
                 success, replay_images = _run_episode(
@@ -472,13 +477,28 @@ def _worker_main(
                     fps=25,
                 )
 
-            logger.info(
-                "%s task=%d episode=%d done success=%s elapsed=%.2fs",
-                log_prefix,
-                task_id,
-                episode_idx,
-                success,
-                elapsed,
+            done_message = (
+                f"{log_prefix} task={task_id} episode={episode_idx} "
+                f"done success={success} elapsed={elapsed:.2f}s"
+            )
+            logger.info(done_message)
+            print(done_message, flush=True)
+
+            with completed_counter.get_lock():
+                completed_counter.value += 1
+                completed = completed_counter.value
+            run_elapsed = max(time.time() - run_started_at, 1e-6)
+            throughput = completed / run_elapsed
+            remaining = max(total_episodes - completed, 0)
+            eta_seconds = remaining / throughput if throughput > 0 else 0.0
+            eta_seconds_rounded = max(0, int(round(eta_seconds)))
+            eta_hours, eta_remainder = divmod(eta_seconds_rounded, 3600)
+            eta_minutes, eta_secs = divmod(eta_remainder, 60)
+            print(
+                f"[suite_progress] completed={completed}/{total_episodes} "
+                f"remaining={remaining} throughput={throughput:.3f} eps/s "
+                f"eta={eta_hours:02d}:{eta_minutes:02d}:{eta_secs:02d}",
+                flush=True,
             )
             results.append(
                 {
@@ -537,6 +557,9 @@ def _run_parallel(args, num_tasks: int, endpoints: Sequence[Tuple[str, int]], re
     t0 = time.perf_counter()
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
+    completed_counter = ctx.Value("i", 0)
+    total_expected_episodes = num_tasks * args.num_trials_per_task
+    run_started_at = time.time()
     processes = []
 
     for worker_id, worker_assignments in enumerate(assignments):
@@ -546,7 +569,17 @@ def _run_parallel(args, num_tasks: int, endpoints: Sequence[Tuple[str, int]], re
         render_gpu_id = None if not render_gpu_ids else render_gpu_ids[worker_id % len(render_gpu_ids)]
         proc = ctx.Process(
             target=_worker_main,
-            args=(worker_id, worker_assignments, args_dict, endpoint, render_gpu_id, result_queue),
+            args=(
+                worker_id,
+                worker_assignments,
+                args_dict,
+                endpoint,
+                render_gpu_id,
+                completed_counter,
+                total_expected_episodes,
+                run_started_at,
+                result_queue,
+            ),
         )
         proc.start()
         processes.append(proc)
