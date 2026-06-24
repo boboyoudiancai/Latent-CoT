@@ -434,8 +434,11 @@ class _QWen3_VL_Interface(nn.Module):
                 - 'loss': language model loss (if labels provided)
                 - 'logits': final logits [B, T, vocab_size]
                 - 'hidden_states': final hidden states [B, T, hidden_size]
+                - 'latent_embeds': embeddings written into <|thinking|> tokens
+                - 'latent_attention_mask': valid latent embedding mask
                 - 'num_reasoning_passes': number of iterative passes performed
         """
+        return_latent_embeds = bool(kwargs.pop("return_latent_embeds", False))
         B, T = input_ids.shape
         device = input_ids.device
         
@@ -523,6 +526,8 @@ class _QWen3_VL_Interface(nn.Module):
                 'loss': outputs.loss if labels is not None else None,
                 'logits': outputs.logits,
                 'hidden_states': outputs.hidden_states[-1],
+                'latent_embeds': outputs.hidden_states[-1].new_zeros((B, 0, outputs.hidden_states[-1].shape[-1])),
+                'latent_attention_mask': torch.zeros((B, 0), dtype=torch.bool, device=device),
                 'num_reasoning_passes': 0,
             }
         
@@ -537,6 +542,16 @@ class _QWen3_VL_Interface(nn.Module):
             (B, T, H), 
             dtype=inputs_embeds.dtype,
             device=device
+        )
+        latent_embeds = torch.zeros(
+            (B, max_n_latents, H),
+            dtype=inputs_embeds.dtype,
+            device=device,
+        )
+        latent_attention_mask = torch.zeros(
+            (B, max_n_latents),
+            dtype=torch.bool,
+            device=device,
         )
         
         # Iterative reasoning passes
@@ -624,7 +639,10 @@ class _QWen3_VL_Interface(nn.Module):
                 local_pos = token_idx - 1 - hidden_states_offset
                 
                 if 0 <= local_pos < hidden_states.shape[1]:
-                    tensor_list[batch_idx][token_idx] = hidden_states[batch_idx, local_pos, :]
+                    latent_embed = hidden_states[batch_idx, local_pos, :]
+                    tensor_list[batch_idx][token_idx] = latent_embed
+                    latent_embeds[batch_idx, pass_idx, :] = latent_embed
+                    latent_attention_mask[batch_idx, pass_idx] = True
                 else:
                     # This should not happen if thinking tokens are consecutive
                     logger.warning(
@@ -684,6 +702,8 @@ class _QWen3_VL_Interface(nn.Module):
             'loss': outputs.loss if labels is not None else None,
             'logits': outputs.logits,
             'hidden_states': full_hidden_states,  # Complete sequence with all reasoning passes
+            'latent_embeds': latent_embeds,
+            'latent_attention_mask': latent_attention_mask,
             'num_reasoning_passes': max_n_latents + 1,
         }
 
