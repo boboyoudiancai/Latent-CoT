@@ -33,6 +33,7 @@ from decoder.latent_text_decoder import (  # noqa: E402
 )
 from laravla.dataloader import build_dataloader  # noqa: E402
 from laravla.model.framework import build_framework  # noqa: E402
+from laravla.model.modules.vlm import get_vlm_model  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--decoder_type",
         default="one_block",
         choices=["one_block", "full_vlm"],
-        help="Auxiliary decoder architecture. full_vlm copies the full Qwen LM like SIM-CoT.",
+        help="Auxiliary decoder architecture. full_vlm loads a separate original Qwen LM like SIM-CoT.",
     )
     parser.add_argument("--decoder_num_heads", type=int, default=8)
     parser.add_argument("--decoder_mlp_ratio", type=float, default=4.0)
@@ -70,6 +71,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--attn_implementation", default=None, help="Override Qwen attention backend, e.g. sdpa")
+    parser.add_argument("--base_vlm", default=None, help="Override framework.qwenvl.base_vlm")
+    parser.add_argument(
+        "--decoder_base_vlm",
+        default=None,
+        help="For full_vlm, initialize the auxiliary decoder Qwen from this original base model path.",
+    )
+    parser.add_argument("--fast_tokenizer_path", default=None, help="Override bridge_annotations.fast_tokenizer_name")
     parser.add_argument("--data_root_dir", default=None)
     parser.add_argument("--data_mix", default=None)
     parser.add_argument("--steps_cache_path", default=None)
@@ -107,12 +115,36 @@ def main() -> None:
     qwen_iface = vlm_model.qwen_vl_interface
     tokenizer = qwen_iface.processor.tokenizer
     qwen_model = qwen_iface.model
-    hidden_size = int(qwen_model.config.hidden_size)
-    vocab_size = int(qwen_model.lm_head.out_features if hasattr(qwen_model.lm_head, "out_features") else len(tokenizer))
+    main_hidden_size = int(qwen_model.config.hidden_size)
+    main_vocab_size = int(
+        qwen_model.lm_head.out_features if hasattr(qwen_model.lm_head, "out_features") else len(tokenizer)
+    )
+    if args.decoder_type == "full_vlm":
+        decoder_qwen_source = args.decoder_base_vlm or cfg.framework.qwenvl.base_vlm
+        decoder_qwen_model = build_original_decoder_qwen_model(
+            cfg,
+            decoder_base_vlm=decoder_qwen_source,
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        decoder_qwen_model = qwen_model
+        decoder_qwen_source = "checkpoint-loaded VLM Qwen shared IO"
+
+    hidden_size = int(decoder_qwen_model.config.hidden_size)
+    vocab_size = int(
+        decoder_qwen_model.lm_head.out_features
+        if hasattr(decoder_qwen_model.lm_head, "out_features")
+        else len(tokenizer)
+    )
+    if hidden_size != main_hidden_size:
+        raise ValueError(f"decoder Qwen hidden size {hidden_size} != main VLM hidden size {main_hidden_size}")
+    if vocab_size != main_vocab_size:
+        raise ValueError(f"decoder Qwen vocab size {vocab_size} != main VLM vocab size {main_vocab_size}")
 
     decoder = build_decoder(
         args=args,
-        qwen_model=qwen_model,
+        qwen_model=decoder_qwen_model,
         hidden_size=hidden_size,
         vocab_size=vocab_size,
         device=device,
@@ -156,6 +188,7 @@ def main() -> None:
         accelerator.print(f"VLM trainable parameters: {trainable_parameter_count(base_module.vlm_model):,}")
         accelerator.print(f"Decoder trainable parameters: {trainable_parameter_count(base_module.decoder):,}")
         accelerator.print(f"Decoder type: {args.decoder_type}")
+        accelerator.print(f"Decoder Qwen init source: {decoder_qwen_source}")
         accelerator.print(f"Shared tokenizer vocab size: {len(tokenizer)}")
         accelerator.print(f"Decoder logits vocab size: {vocab_size}")
         accelerator.print("Decoder and base VLM use the same tokenizer/embedding/lm_head references.")
@@ -252,6 +285,12 @@ class SimCoTTrainingModule(nn.Module):
         self.args = args
         self.dtype = dtype
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if getattr(self.args, "freeze_vlm", False):
+            self.vlm_model.eval()
+        return self
+
     def forward(self, examples: Sequence[dict]) -> Dict[str, torch.Tensor] | None:
         decoder_batch, outputs = self.build_decoder_batch(examples)
         if decoder_batch is None:
@@ -296,14 +335,29 @@ class SimCoTTrainingModule(nn.Module):
             solutions=None,
             action_tokens=action_tokens,
         )
-        outputs = qwen_iface.forward_latent(
-            input_ids=qwen_inputs["input_ids"],
-            attention_mask=qwen_inputs["attention_mask"],
-            pixel_values=qwen_inputs.get("pixel_values"),
-            image_grid_thw=qwen_inputs.get("image_grid_thw"),
-            labels=qwen_inputs.get("labels"),
-            return_latent_embeds=True,
+        labels = qwen_inputs.get("labels")
+        compute_action_token_loss = bool(
+            labels is not None
+            and self.args.action_token_loss_weight
+            and self.args.action_token_loss_weight > 0
         )
+        if not compute_action_token_loss:
+            labels = None
+
+        forward_kwargs = {
+            "input_ids": qwen_inputs["input_ids"],
+            "attention_mask": qwen_inputs["attention_mask"],
+            "pixel_values": qwen_inputs.get("pixel_values"),
+            "image_grid_thw": qwen_inputs.get("image_grid_thw"),
+            "labels": labels,
+            "return_latent_embeds": True,
+        }
+        if getattr(self.args, "freeze_vlm", False):
+            self.vlm_model.eval()
+            with torch.no_grad():
+                outputs = qwen_iface.forward_latent(**forward_kwargs)
+        else:
+            outputs = qwen_iface.forward_latent(**forward_kwargs)
 
         bridge_cfg = self.cfg.datasets.vla_data.bridge_reasoning
         component_order = normalize_component_order(getattr(bridge_cfg, "component_order", None))
@@ -343,6 +397,10 @@ def apply_runtime_overrides(cfg, args: argparse.Namespace):
         cfg.datasets.vla_data.bridge_annotations.write_steps_cache = args.write_steps_cache == "true"
     if args.attn_implementation is not None:
         cfg.framework.qwenvl.attn_implementation = args.attn_implementation
+    if args.base_vlm is not None:
+        cfg.framework.qwenvl.base_vlm = args.base_vlm
+    if args.fast_tokenizer_path is not None:
+        cfg.datasets.vla_data.bridge_annotations.fast_tokenizer_name = args.fast_tokenizer_path
     cfg.framework.enable_latent_reasoning = True
     cfg.framework.img_next.enable = False
     cfg.framework.img_next.loss_weight = 0
@@ -365,9 +423,29 @@ def build_vlm(cfg, checkpoint: Path, device: torch.device, dtype: torch.dtype, f
     if freeze_vlm:
         for param in model.qwen_vl_interface.parameters():
             param.requires_grad = False
+        model.eval()
     else:
         for param in model.qwen_vl_interface.parameters():
             param.requires_grad = True
+    return model
+
+
+def build_original_decoder_qwen_model(
+    cfg,
+    decoder_base_vlm: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> nn.Module:
+    decoder_cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    decoder_cfg.framework.qwenvl.base_vlm = decoder_base_vlm
+    decoder_iface = get_vlm_model(decoder_cfg)
+    model = decoder_iface.model
+    try:
+        model.to(device=device, dtype=dtype)
+    except ValueError as exc:
+        if "device_map" not in str(exc):
+            raise
+    model.train()
     return model
 
 

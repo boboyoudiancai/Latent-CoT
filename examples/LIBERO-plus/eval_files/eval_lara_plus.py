@@ -88,6 +88,16 @@ def _format_csv_arg(items: Sequence[object]) -> str:
     return ",".join(str(item) for item in items)
 
 
+def _expand_gpu_ids_for_replicas(gpu_ids: Sequence[str], replicas_per_gpu: int) -> List[str]:
+    if replicas_per_gpu <= 0:
+        raise ValueError("replicas_per_gpu must be positive")
+
+    expanded_gpu_ids: List[str] = []
+    for gpu_id in gpu_ids:
+        expanded_gpu_ids.extend([str(gpu_id)] * replicas_per_gpu)
+    return expanded_gpu_ids
+
+
 def _repo_root() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[3]
 
@@ -255,27 +265,29 @@ def _auto_configure_parallelism(args, total_episodes: int) -> None:
         logging.info("Auto parallel found no idle GPUs; keeping sequential/single-endpoint settings.")
         return
 
+    expanded_gpu_ids = _expand_gpu_ids_for_replicas(gpu_ids, args.auto_replicas_per_gpu)
     if args.auto_max_endpoints > 0:
-        gpu_ids = gpu_ids[: args.auto_max_endpoints]
+        expanded_gpu_ids = expanded_gpu_ids[: args.auto_max_endpoints]
 
-    endpoint_count = min(len(gpu_ids), max(1, total_episodes))
+    endpoint_count = min(len(expanded_gpu_ids), max(1, total_episodes))
     if endpoint_count <= 1:
         logging.info("Auto parallel found only one usable endpoint; keeping sequential/single-endpoint settings.")
         return
 
-    gpu_ids = gpu_ids[:endpoint_count]
+    expanded_gpu_ids = expanded_gpu_ids[:endpoint_count]
     args.launch_servers = True
-    args.server_gpus = _format_csv_arg(gpu_ids)
-    args.render_gpu_ids = _format_csv_arg(gpu_ids)
+    args.server_gpus = _format_csv_arg(expanded_gpu_ids)
+    args.render_gpu_ids = _format_csv_arg(expanded_gpu_ids)
     args.ports = _format_csv_arg(args.port + idx for idx in range(endpoint_count))
     args.hosts = _format_csv_arg([args.host] * endpoint_count)
     args.num_processes = endpoint_count
 
     cpu_count = os.cpu_count() or endpoint_count
     logging.info(
-        "Auto parallel selected %d endpoints on GPUs=%s (cpu_count=%s, total_episodes=%d)",
+        "Auto parallel selected %d endpoints on GPUs=%s with replicas_per_gpu=%d (cpu_count=%s, total_episodes=%d)",
         endpoint_count,
-        gpu_ids,
+        expanded_gpu_ids,
+        args.auto_replicas_per_gpu,
         cpu_count,
         total_episodes,
     )
@@ -423,6 +435,9 @@ def _worker_main(
     args_dict: Dict,
     endpoint: Tuple[str, int],
     render_gpu_id: Optional[str],
+    completed_counter,
+    total_episodes: int,
+    run_started_at: float,
     result_queue,
 ) -> None:
     try:
@@ -447,7 +462,9 @@ def _worker_main(
             task = task_suite.get_task(task_id)
             initial_states = task_suite.get_task_init_states(task_id)
             env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args_dict["seed"])
-            logger.info("%s task=%d episode=%d start", log_prefix, task_id, episode_idx)
+            start_message = f"{log_prefix} task={task_id} episode={episode_idx} start"
+            logger.info(start_message)
+            print(start_message, flush=True)
             t0 = time.perf_counter()
             try:
                 success, replay_images = _run_episode(
@@ -472,13 +489,28 @@ def _worker_main(
                     fps=25,
                 )
 
-            logger.info(
-                "%s task=%d episode=%d done success=%s elapsed=%.2fs",
-                log_prefix,
-                task_id,
-                episode_idx,
-                success,
-                elapsed,
+            done_message = (
+                f"{log_prefix} task={task_id} episode={episode_idx} "
+                f"done success={success} elapsed={elapsed:.2f}s"
+            )
+            logger.info(done_message)
+            print(done_message, flush=True)
+
+            with completed_counter.get_lock():
+                completed_counter.value += 1
+                completed = completed_counter.value
+            run_elapsed = max(time.time() - run_started_at, 1e-6)
+            throughput = completed / run_elapsed
+            remaining = max(total_episodes - completed, 0)
+            eta_seconds = remaining / throughput if throughput > 0 else 0.0
+            eta_seconds_rounded = max(0, int(round(eta_seconds)))
+            eta_hours, eta_remainder = divmod(eta_seconds_rounded, 3600)
+            eta_minutes, eta_secs = divmod(eta_remainder, 60)
+            print(
+                f"[suite_progress] completed={completed}/{total_episodes} "
+                f"remaining={remaining} throughput={throughput:.3f} eps/s "
+                f"eta={eta_hours:02d}:{eta_minutes:02d}:{eta_secs:02d}",
+                flush=True,
             )
             results.append(
                 {
@@ -529,6 +561,11 @@ def _collect_worker_outputs(processes, result_queue):
 
 def _run_parallel(args, num_tasks: int, endpoints: Sequence[Tuple[str, int]], render_gpu_ids: Sequence[str]) -> None:
     num_processes = args.num_processes if args.num_processes > 0 else len(endpoints)
+    if num_processes > len(endpoints):
+        raise ValueError(
+            f"num_processes ({num_processes}) cannot exceed endpoint count ({len(endpoints)}); "
+            "worker-to-endpoint mapping must remain one-to-one"
+        )
     assignments = _make_assignments(num_tasks, args.num_trials_per_task, num_processes)
     args_dict = vars(args).copy()
     args_dict["tokenizers_parallelism"] = bool(args.tokenizers_parallelism)
@@ -537,16 +574,29 @@ def _run_parallel(args, num_tasks: int, endpoints: Sequence[Tuple[str, int]], re
     t0 = time.perf_counter()
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
+    completed_counter = ctx.Value("i", 0)
+    total_expected_episodes = num_tasks * args.num_trials_per_task
+    run_started_at = time.time()
     processes = []
 
     for worker_id, worker_assignments in enumerate(assignments):
         if not worker_assignments:
             continue
-        endpoint = endpoints[worker_id % len(endpoints)]
-        render_gpu_id = None if not render_gpu_ids else render_gpu_ids[worker_id % len(render_gpu_ids)]
+        endpoint = endpoints[worker_id]
+        render_gpu_id = None if not render_gpu_ids else render_gpu_ids[worker_id]
         proc = ctx.Process(
             target=_worker_main,
-            args=(worker_id, worker_assignments, args_dict, endpoint, render_gpu_id, result_queue),
+            args=(
+                worker_id,
+                worker_assignments,
+                args_dict,
+                endpoint,
+                render_gpu_id,
+                completed_counter,
+                total_expected_episodes,
+                run_started_at,
+                result_queue,
+            ),
         )
         proc.start()
         processes.append(proc)
@@ -718,6 +768,7 @@ def _build_argparser():
     p.add_argument("--auto-parallel", action="store_true")
     p.add_argument("--auto-gpu-max-utilization", type=int, default=10)
     p.add_argument("--auto-gpu-max-memory-mb", type=int, default=2048)
+    p.add_argument("--auto-replicas-per-gpu", type=int, default=2)
     p.add_argument("--auto-max-endpoints", type=int, default=0)
     return p
 

@@ -8,7 +8,6 @@ LaRA-VLA framework.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import copy
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -286,7 +285,7 @@ class OneBlockLatentTextDecoder(nn.Module):
 
 
 class FullQwenLatentTextDecoder(nn.Module):
-    """SIM-CoT-style auxiliary decoder backed by a full Qwen LM copy."""
+    """SIM-CoT-style auxiliary decoder backed by a separately loaded full Qwen LM."""
 
     def __init__(
         self,
@@ -295,7 +294,7 @@ class FullQwenLatentTextDecoder(nn.Module):
         vocab_size: int,
     ) -> None:
         super().__init__()
-        self.model = copy.deepcopy(qwen_model)
+        self.model = qwen_model
         self.hidden_size = int(hidden_size)
         self.vocab_size = int(vocab_size)
         self.input_embeddings = self.model.get_input_embeddings()

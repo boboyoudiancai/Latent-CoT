@@ -59,6 +59,9 @@ ACTION_TOKEN_LOSS_WEIGHT="${ACTION_TOKEN_LOSS_WEIGHT:-1.0}"
 DECODER_TYPE="${DECODER_TYPE:-one_block}"
 DTYPE="${DTYPE:-bf16}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+BASE_VLM_PATH="${BASE_VLM_PATH:-}"
+DECODER_BASE_VLM_PATH="${DECODER_BASE_VLM_PATH:-}"
+FAST_TOKENIZER_PATH="${FAST_TOKENIZER_PATH:-}"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -92,6 +95,16 @@ TRAIN_ARGS=(
   --dtype "${DTYPE}"
   --attn_implementation "${ATTN_IMPLEMENTATION}"
 )
+
+if [[ -n "${BASE_VLM_PATH}" ]]; then
+  TRAIN_ARGS+=(--base_vlm "${BASE_VLM_PATH}")
+fi
+if [[ -n "${DECODER_BASE_VLM_PATH}" ]]; then
+  TRAIN_ARGS+=(--decoder_base_vlm "${DECODER_BASE_VLM_PATH}")
+fi
+if [[ -n "${FAST_TOKENIZER_PATH}" ]]; then
+  TRAIN_ARGS+=(--fast_tokenizer_path "${FAST_TOKENIZER_PATH}")
+fi
 
 if [[ -n "${DATA_ROOT_DIR:-}" ]]; then
   TRAIN_ARGS+=(--data_root_dir "${DATA_ROOT_DIR}")
