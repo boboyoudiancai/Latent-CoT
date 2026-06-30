@@ -35,6 +35,8 @@ class M1Inference:
         cot_mode: str = "implicit",
         thinking_token_count: int = -1,
         img_next_count: int = -1,
+        action_decode_mode: str = "diffusion",
+        fast_max_new_tokens: int = 256,
         # Testing utility: allow init without connecting websocket server
         connect_server: bool = True,
     ) -> None:
@@ -43,8 +45,15 @@ class M1Inference:
         self.client = WebsocketClientPolicy(host, port) if connect_server else None
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
+        self.action_decode_mode = str(action_decode_mode or "diffusion").lower()
+        if self.action_decode_mode not in {"diffusion", "fast"}:
+            raise ValueError(f"Unsupported action_decode_mode={action_decode_mode!r}")
+        self.fast_max_new_tokens = int(fast_max_new_tokens)
 
-        print(f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key} ***")
+        print(
+            f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
+            f"action_decode_mode: {self.action_decode_mode} ***"
+        )
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
         self.image_size = image_size
@@ -75,7 +84,13 @@ class M1Inference:
         self.action_norm_stats = norm_stats[self.unnorm_key]["action"]
 
         # Action chunk size (future_action_window_size + 1)
-        self.action_chunk_size = int(model_config["framework"]["action_model"]["future_action_window_size"]) + 1
+        action_model_cfg = model_config["framework"]["action_model"]
+        if "action_horizon" in action_model_cfg:
+            self.action_chunk_size = int(action_model_cfg["action_horizon"])
+        else:
+            self.action_chunk_size = int(action_model_cfg["future_action_window_size"]) + 1
+        if self.action_decode_mode == "fast":
+            self.action_chunk_size = 1
 
         # ---- latent reasoning prompt formatting config (strict alignment) ----
         self.enable_latent_reasoning = bool(enable_latent_reasoning)
@@ -185,6 +200,9 @@ class M1Inference:
             vla_input["emit_thinking_tokens"] = False
         elif self.cot_mode == "explicit":
             vla_input["cot_mode"] = "explicit"
+        if self.action_decode_mode == "fast":
+            vla_input["use_fast_action_tokens"] = True
+            vla_input["fast_max_new_tokens"] = self.fast_max_new_tokens
 
         if self.client is None:
             raise RuntimeError("Websocket client is not initialized (connect_server=False); cannot call step().")
@@ -195,6 +213,8 @@ class M1Inference:
         action_chunk_size = self.action_chunk_size
         if step % action_chunk_size == 0:
             response = self.client.infer(vla_input)
+            if response.get("status") != "ok":
+                raise RuntimeError(f"Policy server returned error: {response}")
             # unnormalize the action
             # import ipdb; ipdb.set_trace()
             normalized_actions = response["data"]["normalized_actions"] # B, chunk, D        

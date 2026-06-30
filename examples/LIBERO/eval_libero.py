@@ -63,6 +63,8 @@ class Args:
     cot_mode: str = "implicit"
     thinking_token_count: int = -1
     img_next_count: int = -1
+    action_decode_mode: str = "diffusion"
+    fast_max_new_tokens: int = 256
 
 
 def eval_libero(args: Args) -> None:
@@ -111,6 +113,8 @@ def eval_libero(args: Args) -> None:
         cot_mode=args.cot_mode,
         thinking_token_count=args.thinking_token_count,
         img_next_count=args.img_next_count,
+        action_decode_mode=args.action_decode_mode,
+        fast_max_new_tokens=args.fast_max_new_tokens,
     )
 
     # Start evaluation

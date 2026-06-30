@@ -29,6 +29,7 @@ from laravla.model.framework.base_framework import baseframework
 from laravla.model.framework.latent_analysis_mixin import LatentAnalysisMixin
 from laravla.model.modules.vlm import get_vlm_model
 from laravla.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
+from laravla.model.modules.action_model.fast_ActionHeader import Fast_Action_Tokenizer
 from laravla.training.trainer_utils.trainer_tools import resize_images
 from laravla.model.tools import FRAMEWORK_REGISTRY
 
@@ -65,6 +66,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
 
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
+        self._fast_action_processor = None
+        self._fast_action_token_range = None
 
         self.future_action_window_size = config.framework.action_model.future_action_window_size
         self.past_action_window_size = config.framework.action_model.past_action_window_size
@@ -476,6 +479,213 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             selected.append(valid_hidden)
         return torch.stack(selected, dim=0)
 
+    def _get_fast_action_processor(self):
+        if self._fast_action_processor is not None:
+            return self._fast_action_processor
+
+        bridge_cfg = getattr(self.config.datasets.vla_data, "bridge_annotations", {}) or {}
+        fast_tokenizer_name = bridge_cfg.get("fast_tokenizer_name", "playground/Pretrained_models/fast")
+        fast_tokenizer = Fast_Action_Tokenizer(fast_tokenizer_name=fast_tokenizer_name)
+        processor = fast_tokenizer.fast_tokenizer
+        setattr(processor, "time_horizon", 1)
+        setattr(processor, "action_dim", int(self.config.framework.action_model.action_dim))
+        self._fast_action_processor = processor
+        logger.info("Initialized FAST action processor from %s", fast_tokenizer_name)
+        return processor
+
+    def _resolve_fast_action_token_range(self) -> Tuple[int, int]:
+        if self._fast_action_token_range is not None:
+            return self._fast_action_token_range
+
+        tokenizer = self.qwen_vl_interface.processor.tokenizer
+        action_min = tokenizer.convert_tokens_to_ids("<robot_action_0>")
+        action_max = tokenizer.convert_tokens_to_ids("<robot_action_2047>")
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        if (
+            action_min is None
+            or action_max is None
+            or action_min == unk_id
+            or action_max == unk_id
+            or action_min < 0
+            or action_max < 0
+        ):
+            raise ValueError(
+                "FAST action tokens are not present in the loaded VLM tokenizer. "
+                "Use the action-token-augmented Qwen checkpoint."
+            )
+        if action_min > action_max:
+            action_min, action_max = action_max, action_min
+
+        self._fast_action_token_range = (int(action_min), int(action_max))
+        return self._fast_action_token_range
+
+    def _extract_fast_action_token_ids(self, generated_ids: torch.LongTensor) -> List[List[int]]:
+        action_min, action_max = self._resolve_fast_action_token_range()
+        mask = (generated_ids >= action_min) & (generated_ids <= action_max)
+        batch_tokens = []
+        for batch_idx in range(generated_ids.size(0)):
+            idx = mask[batch_idx].nonzero(as_tuple=False).flatten()
+            tokens = generated_ids[batch_idx, idx].detach().cpu().tolist() if idx.numel() else []
+            batch_tokens.append([int(token) for token in tokens])
+        return batch_tokens
+
+    def _decode_fast_actions(self, batch_vlm_tokens: List[List[int]]) -> np.ndarray:
+        processor = self._get_fast_action_processor()
+        action_min, _ = self._resolve_fast_action_token_range()
+        action_dim = int(self.config.framework.action_model.action_dim)
+        zero_action = np.zeros((1, action_dim), dtype=np.float32)
+        decoded_actions = []
+
+        setattr(processor, "time_horizon", 1)
+        setattr(processor, "action_dim", action_dim)
+        for vlm_tokens in batch_vlm_tokens:
+            fast_ids = [int(token) - action_min for token in vlm_tokens]
+            if not fast_ids:
+                logger.warning("FAST generation produced no action tokens; using zero action")
+                decoded_actions.append(zero_action.copy())
+                continue
+            try:
+                decoded = processor.decode([fast_ids])
+                action = np.asarray(decoded[0] if isinstance(decoded, list) else decoded, dtype=np.float32)
+                action = np.squeeze(action)
+                if action.ndim == 1 and action.size == action_dim:
+                    action = action.reshape(1, action_dim)
+                elif action.ndim == 1 and action.size > action_dim:
+                    action = action.reshape(-1, action_dim)[:1]
+                elif action.ndim == 3 and action.shape[0] == 1:
+                    action = action[0]
+                if action.ndim != 2 or action.shape[-1] != action_dim:
+                    raise ValueError(f"decoded FAST action has invalid shape {action.shape}")
+                decoded_actions.append(action[:1].astype(np.float32, copy=False))
+            except Exception as exc:
+                logger.exception("FAST decode failed for %d tokens: %s", len(fast_ids), exc)
+                decoded_actions.append(zero_action.copy())
+
+        logger.info("FAST action token counts: %s", [len(tokens) for tokens in batch_vlm_tokens])
+        return np.stack(decoded_actions, axis=0)
+
+    def _prepare_fast_generation_inputs(self, qwen_inputs):
+        tokenizer = self.qwen_vl_interface.processor.tokenizer
+        input_ids = qwen_inputs["input_ids"]
+        attention_mask = qwen_inputs["attention_mask"]
+        pad_id = int(tokenizer.pad_token_id)
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        newline_ids = tokenizer("\n", add_special_tokens=False).input_ids
+        action_prefix_ids = tokenizer(" Action: ", add_special_tokens=False).input_ids
+
+        if not action_prefix_ids:
+            raise ValueError("Failed to tokenize FAST action prefix")
+
+        prepared = []
+        max_len = 0
+        for ids, mask in zip(input_ids, attention_mask):
+            valid_len = int(mask.sum().item())
+            seq = ids[:valid_len]
+            while seq.numel() > 0 and int(seq[-1].item()) in newline_ids:
+                seq = seq[:-1]
+            if im_end_id is not None and im_end_id >= 0 and seq.numel() > 0 and int(seq[-1].item()) == int(im_end_id):
+                seq = seq[:-1]
+            prefix = torch.tensor(action_prefix_ids, device=seq.device, dtype=seq.dtype)
+            seq = torch.cat([seq, prefix], dim=0)
+            prepared.append(seq)
+            max_len = max(max_len, int(seq.numel()))
+
+        padded_ids = input_ids.new_full((len(prepared), max_len), pad_id)
+        padded_mask = attention_mask.new_zeros((len(prepared), max_len))
+        for row_idx, seq in enumerate(prepared):
+            seq_len = int(seq.numel())
+            padded_ids[row_idx, :seq_len] = seq
+            padded_mask[row_idx, :seq_len] = 1
+
+        qwen_inputs["input_ids"] = padded_ids
+        qwen_inputs["attention_mask"] = padded_mask
+        return qwen_inputs
+
+    def _greedy_generate_fast_with_latent(self, qwen_inputs, max_new_tokens: int) -> torch.LongTensor:
+        tokenizer = self.qwen_vl_interface.processor.tokenizer
+        action_min, action_max = self._resolve_fast_action_token_range()
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id
+        generated = []
+        seen_action = torch.zeros((qwen_inputs["input_ids"].shape[0],), device=qwen_inputs["input_ids"].device, dtype=torch.bool)
+
+        for _ in range(max_new_tokens):
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                outputs = self.qwen_vl_interface.forward_latent(
+                    input_ids=qwen_inputs["input_ids"],
+                    attention_mask=qwen_inputs["attention_mask"],
+                    pixel_values=qwen_inputs.get("pixel_values"),
+                    image_grid_thw=qwen_inputs.get("image_grid_thw"),
+                )
+            logits = outputs["logits"][:, -1, :]
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            generated.append(next_token)
+
+            qwen_inputs["input_ids"] = torch.cat([qwen_inputs["input_ids"], next_token], dim=1)
+            next_mask = torch.ones_like(next_token, dtype=qwen_inputs["attention_mask"].dtype)
+            qwen_inputs["attention_mask"] = torch.cat([qwen_inputs["attention_mask"], next_mask], dim=1)
+
+            is_action = (next_token[:, 0] >= action_min) & (next_token[:, 0] <= action_max)
+            seen_action |= is_action
+            is_stop = torch.zeros_like(seen_action)
+            if eos_id is not None:
+                is_stop |= next_token[:, 0] == int(eos_id)
+            if pad_id is not None:
+                is_stop |= next_token[:, 0] == int(pad_id)
+            is_stop |= seen_action & (~is_action)
+            if bool(is_stop.all().item()):
+                break
+
+        if not generated:
+            return qwen_inputs["input_ids"].new_empty((qwen_inputs["input_ids"].shape[0], 0))
+        return torch.cat(generated, dim=1)
+
+    @torch.inference_mode()
+    def _predict_action_fast(
+        self,
+        batch_images: List[List[Image.Image]],
+        instructions: List[str],
+        **kwargs,
+    ) -> dict:
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+        )
+        qwen_inputs.pop("labels", None)
+        qwen_inputs = self._prepare_fast_generation_inputs(qwen_inputs)
+
+        max_new_tokens = int(kwargs.get("fast_max_new_tokens", 256))
+        do_sample = bool(kwargs.get("do_sample", False))
+        use_iterative_forward = bool(kwargs.get("use_iterative_forward", False)) and hasattr(
+            self.qwen_vl_interface, "forward_latent"
+        )
+        if use_iterative_forward:
+            if do_sample:
+                logger.warning("FAST latent generation currently uses greedy decoding; ignoring do_sample=True")
+            generated_ids = self._greedy_generate_fast_with_latent(qwen_inputs, max_new_tokens=max_new_tokens)
+        else:
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "pad_token_id": self.qwen_vl_interface.processor.tokenizer.pad_token_id,
+                "eos_token_id": self.qwen_vl_interface.processor.tokenizer.eos_token_id,
+            }
+            if do_sample:
+                gen_kwargs["temperature"] = float(kwargs.get("temperature", 0.7))
+
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                generated_ids = self.qwen_vl_interface.model.generate(**qwen_inputs, **gen_kwargs)
+
+            prompt_len = qwen_inputs["input_ids"].shape[1]
+            generated_ids = generated_ids[:, prompt_len:]
+        batch_vlm_tokens = self._extract_fast_action_token_ids(generated_ids)
+        normalized_actions = self._decode_fast_actions(batch_vlm_tokens)
+        return {
+            "normalized_actions": normalized_actions,
+            "thinking_gen_time": 0.0,
+            "fast_action_token_counts": [len(tokens) for tokens in batch_vlm_tokens],
+        }
+
     def _generate_explicit_cot(
         self,
         batch_images: List[List[Image.Image]],
@@ -552,6 +762,9 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        if bool(kwargs.get("use_fast_action_tokens", False)):
+            return self._predict_action_fast(batch_images=batch_images, instructions=instructions, **kwargs)
     
         use_iterative_forward = bool(kwargs.get("use_iterative_forward", False)) and hasattr(
             self.qwen_vl_interface, "forward_latent"
