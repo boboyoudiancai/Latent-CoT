@@ -165,11 +165,12 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     warmup_steps = int(args.max_train_steps * args.warmup_ratio)
+    scheduler_process_scale = max(1, accelerator.num_processes)
     scheduler = get_scheduler(
         "cosine",
         optimizer=optimizer,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=args.max_train_steps,
+        num_warmup_steps=warmup_steps * scheduler_process_scale,
+        num_training_steps=args.max_train_steps * scheduler_process_scale,
     )
 
     dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
@@ -192,6 +193,13 @@ def main() -> None:
         accelerator.print(f"Shared tokenizer vocab size: {len(tokenizer)}")
         accelerator.print(f"Decoder logits vocab size: {vocab_size}")
         accelerator.print("Decoder and base VLM use the same tokenizer/embedding/lm_head references.")
+        accelerator.print(
+            "Scheduler: cosine "
+            f"warmup_steps={warmup_steps} adjusted_warmup_steps={warmup_steps * scheduler_process_scale} "
+            f"max_train_steps={args.max_train_steps} "
+            f"adjusted_training_steps={args.max_train_steps * scheduler_process_scale} "
+            f"process_scale={scheduler_process_scale}"
+        )
         accelerator.print(f"Output dir: {output_dir}")
 
     completed_steps = 0
