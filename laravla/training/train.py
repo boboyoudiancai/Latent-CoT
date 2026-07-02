@@ -230,10 +230,19 @@ class LaRA_VLA_Trainer(TrainerUtils):
         self.accelerator = accelerator
 
         # training status tracking
-        self.completed_steps = 0
+        self.completed_steps = self._get_start_step()
         self.total_batch_size = self._calculate_total_batch_size()
         self.min_save_step = getattr(self.config.trainer, "min_save_step", 0)
         self._img_next_ema_updates = 0
+
+    def _get_start_step(self):
+        """Optional absolute step offset for weight-only resume."""
+        trainer_cfg = self.config.trainer
+        if hasattr(trainer_cfg, "get"):
+            start_step = trainer_cfg.get("start_step", 0)
+        else:
+            start_step = getattr(trainer_cfg, "start_step", 0)
+        return int(start_step or 0)
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -268,8 +277,38 @@ class LaRA_VLA_Trainer(TrainerUtils):
             # self.vlm_train_dataloader
         )
 
+        self._fast_forward_scheduler()
         self._init_wandb()
         self._init_checkpointing()
+
+    def _fast_forward_scheduler(self):
+        """Advance LR scheduler when resuming from model weights only."""
+        if self.completed_steps <= 0:
+            return
+        self.lr_scheduler.last_epoch = self.completed_steps
+        resumed_lrs = None
+        if hasattr(self.lr_scheduler, "lr_lambdas") and hasattr(self.lr_scheduler, "base_lrs"):
+            resumed_lrs = [
+                lr_lambda(self.completed_steps) * base_lr
+                for lr_lambda, base_lr in zip(self.lr_scheduler.lr_lambdas, self.lr_scheduler.base_lrs)
+            ]
+        elif hasattr(self.lr_scheduler, "_get_closed_form_lr"):
+            resumed_lrs = self.lr_scheduler._get_closed_form_lr()
+
+        if resumed_lrs is not None:
+            self.lr_scheduler._last_lr = resumed_lrs
+            optimizers = [self.optimizer, getattr(self.lr_scheduler, "optimizer", None)]
+            seen_optimizers = set()
+            for optimizer in optimizers:
+                if optimizer is None or id(optimizer) in seen_optimizers:
+                    continue
+                param_groups = getattr(optimizer, "param_groups", None)
+                if param_groups is None:
+                    continue
+                seen_optimizers.add(id(optimizer))
+                for param_group, lr in zip(param_groups, resumed_lrs):
+                    param_group["lr"] = lr
+        self.accelerator.print(f"Weight-only resume: start_step={self.completed_steps}")
 
     def _calculate_total_batch_size(self):
         """calculate global batch size"""
@@ -373,7 +412,9 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
         # create progress bar
         progress_bar = tqdm(
-            range(self.config.trainer.max_train_steps), disable=not self.accelerator.is_local_main_process
+            range(self.config.trainer.max_train_steps),
+            initial=self.completed_steps,
+            disable=not self.accelerator.is_local_main_process,
         )
 
         # main training loop

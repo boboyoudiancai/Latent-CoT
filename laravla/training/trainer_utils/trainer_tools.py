@@ -228,6 +228,8 @@ class TrainerUtils:
         if dist.get_rank() == 0:
             print(f"📦 loading checkpoint: {checkpoint_path}")
         try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True)
+        except TypeError:
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
         except Exception as e:
             raise RuntimeError(f"❌ loading checkpoint failed: {e}")
