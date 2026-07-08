@@ -52,10 +52,14 @@ EVAL_DECODE_TOKENS="${EVAL_DECODE_TOKENS:-64}"
 DECODER_LR="${DECODER_LR:-1e-4}"
 VLM_LR="${VLM_LR:-1e-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-cosine_with_min_lr}"
+MIN_LR="${MIN_LR:-5e-7}"
 GRADIENT_CLIPPING="${GRADIENT_CLIPPING:-1.0}"
 DECODER_LOSS_WEIGHT="${DECODER_LOSS_WEIGHT:-1.0}"
 ACTION_TOKEN_LOSS_WEIGHT="${ACTION_TOKEN_LOSS_WEIGHT:-1.0}"
+DECODER_LOSS_WEIGHT_SCHEDULE="${DECODER_LOSS_WEIGHT_SCHEDULE:-constant}"
+DECODER_LOSS_WEIGHT_FINAL="${DECODER_LOSS_WEIGHT_FINAL:-}"
 DECODER_TYPE="${DECODER_TYPE:-one_block}"
 DTYPE="${DTYPE:-bf16}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
@@ -88,14 +92,20 @@ TRAIN_ARGS=(
   --vlm_learning_rate "${VLM_LR}"
   --weight_decay "${WEIGHT_DECAY}"
   --warmup_ratio "${WARMUP_RATIO}"
+  --lr_scheduler_type "${LR_SCHEDULER_TYPE}"
+  --min_lr "${MIN_LR}"
   --gradient_clipping "${GRADIENT_CLIPPING}"
   --decoder_loss_weight "${DECODER_LOSS_WEIGHT}"
   --action_token_loss_weight "${ACTION_TOKEN_LOSS_WEIGHT}"
+  --decoder_loss_weight_schedule "${DECODER_LOSS_WEIGHT_SCHEDULE}"
   --decoder_type "${DECODER_TYPE}"
   --dtype "${DTYPE}"
   --attn_implementation "${ATTN_IMPLEMENTATION}"
 )
 
+if [[ -n "${DECODER_LOSS_WEIGHT_FINAL}" ]]; then
+  TRAIN_ARGS+=(--decoder_loss_weight_final "${DECODER_LOSS_WEIGHT_FINAL}")
+fi
 if [[ -n "${BASE_VLM_PATH}" ]]; then
   TRAIN_ARGS+=(--base_vlm "${BASE_VLM_PATH}")
 fi

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import sys
@@ -17,6 +18,7 @@ from typing import Any, Dict, List, Sequence
 import torch
 import torch.nn as nn
 from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate.utils import DistributedType
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import get_scheduler
@@ -45,7 +47,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decoder_learning_rate", type=float, default=1e-4)
     parser.add_argument("--vlm_learning_rate", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--warmup_ratio", type=float, default=0.03)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--lr_scheduler_type",
+        default="cosine_with_min_lr",
+        help="Scheduler name passed to transformers.get_scheduler.",
+    )
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=5e-7,
+        help="Minimum LR for cosine_with_min_lr, matching the main VLM stages.",
+    )
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--gradient_clipping", type=float, default=1.0)
     parser.add_argument("--save_interval", type=int, default=500)
@@ -55,6 +68,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval_samples", type=int, default=4)
     parser.add_argument("--eval_decode_tokens", type=int, default=64)
     parser.add_argument("--decoder_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--decoder_loss_weight_final",
+        type=float,
+        default=None,
+        help="Final decoder loss weight for scheduled decay. Defaults to 0.0 when a decay schedule is used.",
+    )
+    parser.add_argument(
+        "--decoder_loss_weight_schedule",
+        default="constant",
+        choices=["constant", "linear", "cosine", "hold_half_decay_quarter"],
+        help="How to change decoder_loss_weight over optimizer steps.",
+    )
     parser.add_argument("--action_token_loss_weight", type=float, default=None)
     parser.add_argument("--freeze_vlm", action="store_true", help="Ablation only: train decoder without updating VLM")
     parser.add_argument(
@@ -87,7 +112,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    accelerator = Accelerator(deepspeed_plugin=DeepSpeedPlugin())
+    gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps))
+    args.gradient_accumulation_steps = gradient_accumulation_steps
+    if args.decoder_loss_weight_final is None and args.decoder_loss_weight_schedule != "constant":
+        args.decoder_loss_weight_final = 0.0
+    if args.decoder_loss_weight_final is not None and args.decoder_loss_weight_final < 0:
+        raise ValueError("decoder_loss_weight_final must be non-negative")
+    accelerator = Accelerator(
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        deepspeed_plugin=DeepSpeedPlugin(
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_clipping=args.gradient_clipping,
+        ),
+    )
     output_dir = Path(args.output_dir)
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -166,11 +203,15 @@ def main() -> None:
     )
     warmup_steps = int(args.max_train_steps * args.warmup_ratio)
     scheduler_process_scale = max(1, accelerator.num_processes)
+    scheduler_kwargs = {}
+    if args.lr_scheduler_type == "cosine_with_min_lr":
+        scheduler_kwargs["min_lr"] = args.min_lr
     scheduler = get_scheduler(
-        "cosine",
+        args.lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=warmup_steps * scheduler_process_scale,
         num_training_steps=args.max_train_steps * scheduler_process_scale,
+        scheduler_specific_kwargs=scheduler_kwargs,
     )
 
     dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
@@ -180,6 +221,7 @@ def main() -> None:
         scheduler,
         dataloader,
     )
+    uses_deepspeed = accelerator.distributed_type == DistributedType.DEEPSPEED
     data_iter = iter(dataloader)
 
     if accelerator.is_main_process:
@@ -194,11 +236,30 @@ def main() -> None:
         accelerator.print(f"Decoder logits vocab size: {vocab_size}")
         accelerator.print("Decoder and base VLM use the same tokenizer/embedding/lm_head references.")
         accelerator.print(
-            "Scheduler: cosine "
+            f"Scheduler: {args.lr_scheduler_type} "
             f"warmup_steps={warmup_steps} adjusted_warmup_steps={warmup_steps * scheduler_process_scale} "
             f"max_train_steps={args.max_train_steps} "
             f"adjusted_training_steps={args.max_train_steps * scheduler_process_scale} "
-            f"process_scale={scheduler_process_scale}"
+            f"process_scale={scheduler_process_scale} "
+            f"scheduler_kwargs={scheduler_kwargs}"
+        )
+        scheduler_inner = getattr(scheduler, "scheduler", None)
+        accelerator.print(
+            "Scheduler wrapper: "
+            f"{type(scheduler).__name__}"
+            f"{' -> ' + type(scheduler_inner).__name__ if scheduler_inner is not None else ''}"
+        )
+        accelerator.print(
+            "Decoder loss weight: "
+            f"schedule={args.decoder_loss_weight_schedule} "
+            f"initial={decoder_loss_weight_for_step(args, 0):.6g} "
+            f"final={decoder_loss_weight_for_step(args, args.max_train_steps - 1):.6g}"
+        )
+        accelerator.print(
+            "Gradient accumulation: "
+            f"requested={args.gradient_accumulation_steps} "
+            f"accelerator={accelerator.gradient_accumulation_steps} "
+            f"effective_global_batch={args.per_device_batch_size * accelerator.num_processes * args.gradient_accumulation_steps}"
         )
         accelerator.print(f"Output dir: {output_dir}")
 
@@ -209,32 +270,35 @@ def main() -> None:
     while completed_steps < args.max_train_steps:
         accum_loss_dict: Dict[str, torch.Tensor] | None = None
         usable_micro_batches = 0
-        for micro_step in range(args.gradient_accumulation_steps):
+        while usable_micro_batches < args.gradient_accumulation_steps and completed_steps < args.max_train_steps:
             try:
                 examples = next(data_iter)
             except StopIteration:
                 data_iter = iter(dataloader)
                 examples = next(data_iter)
 
-            loss_dict = training_module(examples)
+            loss_dict = training_module(examples, train_step=completed_steps)
             if loss_dict is None:
                 continue
             loss = loss_dict["total_loss"]
-            accelerator.backward(loss / args.gradient_accumulation_steps)
+            accelerator.backward(loss)
             usable_micro_batches += 1
             accum_loss_dict = merge_loss_dicts(accum_loss_dict, loss_dict)
 
         if usable_micro_batches == 0 or accum_loss_dict is None:
             continue
 
-        if args.gradient_clipping and args.gradient_clipping > 0:
-            accelerator.clip_grad_norm_(
-                [p for p in training_module.parameters() if p.requires_grad],
-                args.gradient_clipping,
-            )
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
+        if not uses_deepspeed:
+            if args.gradient_clipping and args.gradient_clipping > 0:
+                accelerator.clip_grad_norm_(
+                    [p for p in training_module.parameters() if p.requires_grad],
+                    args.gradient_clipping,
+                )
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
+        else:
+            step_deepspeed_scheduler(scheduler, accelerator)
 
         completed_steps += 1
         progress.update(1)
@@ -244,14 +308,16 @@ def main() -> None:
             averaged_loss_dict = average_loss_dict(accum_loss_dict, usable_micro_batches)
             metrics = gather_scalar_metrics(accelerator, averaged_loss_dict)
         if accelerator.is_main_process and metrics is not None:
-            lr = scheduler.get_last_lr()[0]
+            lr = current_learning_rate(scheduler, optimizer)
             log_data = {
                 "step": completed_steps,
                 "loss": metrics.get("total_loss"),
                 "learning_rate": lr,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "usable_micro_batches": usable_micro_batches,
             }
             for key, value in metrics.items():
-                if key.endswith("_loss"):
+                if key.endswith("_loss") or key.endswith("_weight"):
                     log_data[key] = value
             accelerator.print(json.dumps(log_data))
 
@@ -299,7 +365,7 @@ class SimCoTTrainingModule(nn.Module):
             self.vlm_model.eval()
         return self
 
-    def forward(self, examples: Sequence[dict]) -> Dict[str, torch.Tensor] | None:
+    def forward(self, examples: Sequence[dict], train_step: int | None = None) -> Dict[str, torch.Tensor] | None:
         decoder_batch, outputs = self.build_decoder_batch(examples)
         if decoder_batch is None:
             return None
@@ -316,7 +382,8 @@ class SimCoTTrainingModule(nn.Module):
 
         decoder_loss = decoder_out["loss"]
         action_token_loss = outputs.get("loss")
-        total_loss = self.args.decoder_loss_weight * decoder_loss
+        decoder_loss_weight = decoder_loss_weight_for_step(self.args, train_step)
+        total_loss = decoder_loss_weight * decoder_loss
         if (
             action_token_loss is not None
             and self.args.action_token_loss_weight
@@ -327,6 +394,7 @@ class SimCoTTrainingModule(nn.Module):
         result = {
             "total_loss": total_loss,
             "decoder_loss": decoder_loss,
+            "decoder_loss_weight": decoder_loss.detach().new_tensor(decoder_loss_weight),
         }
         if action_token_loss is not None:
             result["action_token_loss"] = action_token_loss
@@ -539,6 +607,42 @@ def gather_scalar_metrics(accelerator: Accelerator, loss_dict: Dict[str, torch.T
     return metrics
 
 
+def step_deepspeed_scheduler(scheduler, accelerator: Accelerator) -> None:
+    if scheduler is None:
+        return
+    if type(scheduler).__name__ == "AcceleratedScheduler":
+        scheduler.step()
+        return
+
+    inner_scheduler = getattr(scheduler, "scheduler", None)
+    if inner_scheduler is not None and callable(getattr(inner_scheduler, "step", None)):
+        if type(inner_scheduler).__name__ == "AcceleratedScheduler":
+            inner_scheduler.step()
+        else:
+            for _ in range(max(1, int(accelerator.num_processes))):
+                inner_scheduler.step()
+        return
+
+    step_fn = getattr(scheduler, "step", None)
+    if callable(step_fn):
+        step_fn()
+
+
+def current_learning_rate(scheduler, optimizer) -> float | None:
+    for candidate in (getattr(scheduler, "scheduler", None), scheduler):
+        get_last_lr = getattr(candidate, "get_last_lr", None)
+        if callable(get_last_lr):
+            lrs = get_last_lr()
+            if lrs:
+                return float(lrs[0])
+
+    inner_optimizer = getattr(optimizer, "optimizer", optimizer)
+    param_groups = getattr(inner_optimizer, "param_groups", None)
+    if param_groups:
+        return float(param_groups[0].get("lr", 0.0))
+    return None
+
+
 @torch.no_grad()
 def run_decoder_eval(
     module: SimCoTTrainingModule,
@@ -554,6 +658,7 @@ def run_decoder_eval(
     action_token_losses: List[float] = []
     samples: List[Dict[str, Any]] = []
     data_iter = iter(dataloader)
+    decoder_loss_weight = decoder_loss_weight_for_step(args, max(0, step - 1))
 
     for _ in range(max(1, args.eval_batches)):
         try:
@@ -574,7 +679,7 @@ def run_decoder_eval(
             target_attention_mask=decoder_batch.target_attention_mask,
         )
         decoder_loss = decoder_out["loss"]
-        total_loss = args.decoder_loss_weight * decoder_loss
+        total_loss = decoder_loss_weight * decoder_loss
         action_token_loss = outputs.get("loss")
         if (
             action_token_loss is not None
@@ -624,6 +729,7 @@ def run_decoder_eval(
         "step": step,
         "eval_total_loss": eval_total_loss,
         "eval_decoder_loss": eval_decoder_loss,
+        "decoder_loss_weight": decoder_loss_weight,
         "eval_action_token_loss": eval_action_token_loss,
         "num_eval_batches": len(total_losses),
         "samples": samples,
@@ -640,6 +746,36 @@ def clean_text(text: str) -> str:
 
 def mean_or_none(values: Sequence[float]) -> float | None:
     return sum(values) / len(values) if values else None
+
+
+def decoder_loss_weight_for_step(args: argparse.Namespace, step: int | None) -> float:
+    initial = float(args.decoder_loss_weight)
+    schedule = getattr(args, "decoder_loss_weight_schedule", "constant")
+    final_arg = getattr(args, "decoder_loss_weight_final", None)
+    if schedule == "constant":
+        return initial
+
+    total = max(1, int(args.max_train_steps) - 1)
+    progress = min(1.0, max(0.0, float(step or 0) / float(total)))
+    if schedule == "hold_half_decay_quarter":
+        if progress < 0.5:
+            return initial
+        if progress >= 0.75:
+            return 0.0
+        decay_progress = (progress - 0.5) / 0.25
+        return initial * 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+
+    if final_arg is None:
+        return initial
+
+    final = float(final_arg)
+    if schedule == "linear":
+        factor = 1.0 - progress
+    elif schedule == "cosine":
+        factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+    else:
+        raise ValueError(f"unsupported decoder_loss_weight_schedule: {schedule}")
+    return final + (initial - final) * factor
 
 
 def normalize_component_order(value: Any) -> List[str]:
