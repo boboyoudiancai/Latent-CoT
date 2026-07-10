@@ -11,9 +11,11 @@ export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="${TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD:-1}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 LARAVLA_PYTHON="${LARAVLA_PYTHON:-/home/liuyue/miniconda3/envs/starvla/bin/python}"
-LIBERO_PYTHON="${LIBERO_PYTHON:-/home/liuyue/miniconda3/envs/libero/bin/python}"
+LIBERO_PYTHON="${LIBERO_PYTHON:-/home/liuyue/miniconda3/envs/liberoplus/bin/python}"
 LIBERO_HOME="${LIBERO_HOME:-/home/liuyue/LIBERO}"
 LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-/home/liuyue/.libero}"
+MAGICK_HOME="${MAGICK_HOME:-/home/liuyue/miniconda3/envs/liberoplus}"
+export LD_LIBRARY_PATH="${MAGICK_HOME}/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 
 DEFAULT_CKPT_PATH="${DEFAULT_CKPT_PATH:-}"
 CKPT_PATH="${1:-${YOUR_CKPT:-${DEFAULT_CKPT_PATH:-}}}"
@@ -164,6 +166,7 @@ mkdir -p "${EVAL_ROOT}"
 
 export LIBERO_HOME
 export LIBERO_CONFIG_PATH
+export MAGICK_HOME
 export LARAVLA_PYTHON
 export SERVER_PY="${LARAVLA_PYTHON}"
 export CUDA_VISIBLE_DEVICES
@@ -217,6 +220,8 @@ export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM}"
 export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="${TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD}"
 export MUJOCO_GL="${MUJOCO_GL}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}"
+export MAGICK_HOME="${MAGICK_HOME}"
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}"
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 
 cat > "\$SUITE_DIR/meta_lara_infer.txt" <<META
