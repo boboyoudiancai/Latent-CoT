@@ -4,8 +4,8 @@ This directory contains the recommended LIBERO evaluation entrypoints.
 
 Main files:
 
-- `eval_libero.py`: evaluate one LIBERO suite against one policy server
-- `eval_libero_all.sh`: recommended parallel multi-suite evaluation
+- `eval_libero.py`: evaluate one LIBERO suite; supports the same multi-endpoint policy-server acceleration as `examples/LIBERO-plus/eval_files/eval_lara_plus.py`
+- `eval_libero_all.sh`: recommended multi-suite launcher; writes per-suite `run_command.sh`, then runs suites sequentially
 - `run_all_ckpts_libero_all.sh`: batch evaluation for many checkpoints
 
 ## Prerequisites
@@ -36,10 +36,12 @@ python -c "from libero.libero import benchmark; print('OK')"
 ## Recommended: Parallel Evaluation
 
 ```bash
-LARAVLA_PYTHON=/path/to/laravla/python \
-LIBERO_PYTHON=/path/to/libero/python \
-LIBERO_HOME=/path/to/LIBERO \
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
+LARAVLA_PYTHON=/home/liuyue/miniconda3/envs/starvla/bin/python \
+LIBERO_PYTHON=/home/liuyue/miniconda3/envs/libero/bin/python \
+LIBERO_HOME=/home/liuyue/LIBERO \
+LIBERO_CONFIG_PATH=/home/liuyue/.libero \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+REPLICAS_PER_GPU=2 \
 TASK_SUITES=libero_goal,libero_spatial,libero_object,libero_10 \
 bash examples/LIBERO/eval_libero_all.sh /abs/path/to/checkpoint.pt
 ```
@@ -50,6 +52,8 @@ Outputs are written under:
 ```text
 <checkpoint_dir>/eval_libero_implicit_parallel/<checkpoint_name>/
 ```
+
+Each suite directory contains `run_command.sh`, `eval.log`, `<suite>.log`, `parallel_metrics.json`, and `server_logs/`.
 
 ## Batch Evaluation for Many Checkpoints
 
