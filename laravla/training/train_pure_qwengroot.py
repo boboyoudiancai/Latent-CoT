@@ -40,9 +40,25 @@ from laravla.training.trainer_utils.trainer_tools import build_param_lr_groups
 from laravla.training.trainer_utils.cot_mode_utils import get_implicit_flags
 
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
+accelerator = None
+
+
+def _gradient_accumulation_steps(cfg) -> int:
+    trainer_cfg = getattr(cfg, "trainer", None)
+    steps = getattr(trainer_cfg, "gradient_accumulation_steps", 1) if trainer_cfg is not None else 1
+    return max(1, int(steps or 1))
+
+
+def build_accelerator(cfg) -> Accelerator:
+    global accelerator
+    grad_acc_steps = _gradient_accumulation_steps(cfg)
+    deepspeed_plugin = DeepSpeedPlugin(gradient_accumulation_steps=grad_acc_steps)
+    accelerator = Accelerator(
+        deepspeed_plugin=deepspeed_plugin,
+        gradient_accumulation_steps=grad_acc_steps,
+    )
+    accelerator.print(accelerator.state)
+    return accelerator
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -313,7 +329,7 @@ class LaRA_VLA_Trainer(TrainerUtils):
     def _save_checkpoint(self):
         """save current training state"""
 
-        if accelerator.is_main_process:
+        if self.accelerator.is_main_process:
 
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
@@ -327,7 +343,7 @@ class LaRA_VLA_Trainer(TrainerUtils):
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
             self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
-        accelerator.wait_for_everyone()
+        self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
         """record training metrics"""
@@ -484,8 +500,6 @@ class LaRA_VLA_Trainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """execute single training step"""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             # VLA task forward propagation
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
@@ -501,15 +515,16 @@ class LaRA_VLA_Trainer(TrainerUtils):
             self.accelerator.backward(total_loss)
 
             # gradient clipping
-            if self.config.trainer.gradient_clipping is not None:
+            if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             # optimizer step
             self.optimizer.step()
-            self.lr_scheduler.step()
 
-            # EMA update for img_next target vision encoder (if enabled)
             if self.accelerator.sync_gradients:
+                self.lr_scheduler.step()
+
+                # EMA update for img_next target vision encoder (if enabled)
                 self._img_next_ema_updates += 1
                 if self._img_next_ema_updates % 2 == 0:
                     try:
@@ -522,6 +537,8 @@ class LaRA_VLA_Trainer(TrainerUtils):
                             qwen_iface.update_img_next_ema()
                     except Exception as e:
                         logger.warning(f"[img_next_ema] update skipped due to error: {e}")
+
+            self.optimizer.zero_grad()
 
         # Build metrics dictionary
         metrics = {}
@@ -558,6 +575,7 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
 def main(cfg) -> None:
     logger.info("ECoT VLA Training :: Warming Up")
+    accelerator = build_accelerator(cfg)
 
     # Pure QwenGR00T entrypoint: do not force implicit latent reasoning.
     mode_flags = {

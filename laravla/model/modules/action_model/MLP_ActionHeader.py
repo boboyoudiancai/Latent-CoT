@@ -8,6 +8,14 @@
 import torch.nn as nn
 
 
+def _cfg_get(node, key, default=None):
+    if node is None:
+        return default
+    if hasattr(node, "get"):
+        return node.get(key, default)
+    return getattr(node, key, default)
+
+
 class MLPResNetBlock(nn.Module):
     """One MLP ResNet block with a residual connection."""
     def __init__(self, dim):
@@ -97,17 +105,23 @@ def get_action_model(config=None):
         ActionModel: Initialized diffusion action head.
     """
     action_model_cfg = config.framework.action_model
-    model_type = action_model_cfg.action_model_type
-    action_hidden_dim = action_model_cfg.action_hidden_dim
-    action_dim = action_model_cfg.action_dim
-    future_action_window_size = action_model_cfg.future_action_window_size
-    past_action_window_size = action_model_cfg.past_action_window_size
+    model_type = _cfg_get(action_model_cfg, "action_model_type", "MLP")
+    if model_type != "MLP":
+        raise ValueError(f"MLP_ActionHeader only supports action_model_type='MLP', got {model_type!r}")
+    action_hidden_dim = int(_cfg_get(action_model_cfg, "action_hidden_dim"))
+    action_dim = int(_cfg_get(action_model_cfg, "action_dim", 7))
+    action_horizon = _cfg_get(action_model_cfg, "action_horizon", None)
+    if action_horizon is None:
+        future_action_window_size = int(_cfg_get(action_model_cfg, "future_action_window_size", 7))
+        past_action_window_size = int(_cfg_get(action_model_cfg, "past_action_window_size", 0))
+        action_horizon = past_action_window_size + 1 + future_action_window_size
+    action_horizon = int(action_horizon)
 
     action_model = L1RegressionActionHead(
         input_dim=action_hidden_dim,
         hidden_dim=action_hidden_dim*2,
         action_dim=action_dim,
-        NUM_ACTIONS_CHUNK=past_action_window_size+1+future_action_window_size,
+        NUM_ACTIONS_CHUNK=action_horizon,
     )
 
     return action_model

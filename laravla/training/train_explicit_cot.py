@@ -15,7 +15,7 @@ from omegaconf import OmegaConf
 from laravla.model.framework import build_framework
 from laravla.training.train import (
     LaRA_VLA_Trainer,
-    accelerator,
+    build_accelerator,
     logger,
     prepare_data,
     setup_directories,
@@ -58,6 +58,7 @@ def _ensure_explicit_cot_config(cfg):
 
 def main(cfg) -> None:
     cfg = _ensure_explicit_cot_config(cfg)
+    accelerator = build_accelerator(cfg)
     training_stage = getattr(cfg.framework, "training_stage", "full")
     logger.info("[Explicit CoT] training_stage=%s, flags=%s", training_stage, EXPLICIT_COT_FLAGS)
 
