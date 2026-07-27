@@ -46,7 +46,7 @@ class M1Inference:
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
         self.action_decode_mode = str(action_decode_mode or "diffusion").lower()
-        if self.action_decode_mode not in {"diffusion", "fast"}:
+        if self.action_decode_mode not in {"diffusion", "fast", "mlp"}:
             raise ValueError(f"Unsupported action_decode_mode={action_decode_mode!r}")
         self.fast_max_new_tokens = int(fast_max_new_tokens)
 
@@ -189,9 +189,10 @@ class M1Inference:
             "instructions": [instruction],
             "unnorm_key": self.unnorm_key,
             "do_sample": False,
-            "use_ddim": self.use_ddim,
-            "num_ddim_steps": self.num_ddim_steps,
         }
+        if self.action_decode_mode == "diffusion":
+            vla_input["use_ddim"] = self.use_ddim
+            vla_input["num_ddim_steps"] = self.num_ddim_steps
 
         # Step 4: Explicitly trigger implicit latent reasoning path on server
         if self.enable_latent_reasoning and self.cot_mode == "implicit":

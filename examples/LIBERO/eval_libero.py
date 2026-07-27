@@ -758,7 +758,7 @@ def _build_argparser():
     p.add_argument("--cot-mode", default="implicit")
     p.add_argument("--thinking-token-count", type=int, default=-1)
     p.add_argument("--img-next-count", type=int, default=-1)
-    p.add_argument("--action-decode-mode", choices=("diffusion", "fast"), default="diffusion")
+    p.add_argument("--action-decode-mode", choices=("diffusion", "fast", "mlp"), default="diffusion")
     p.add_argument("--fast-max-new-tokens", type=int, default=256)
     p.add_argument("--num-processes", type=int, default=0)
     p.add_argument("--render-gpu-ids", default="")
