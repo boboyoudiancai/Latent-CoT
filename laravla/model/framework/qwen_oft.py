@@ -327,6 +327,11 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
             [example["state"] for example in examples] if "state" in examples[0] else None
         )  # List[ndarray (1, state_dim)] or None
 
+        cot_mode = str(self.config.framework.get("cot_mode", "none")).lower()
+        if self.training_stage != "reasoning_only" and cot_mode == "explicit":
+            from laravla.model.framework.laravla import Qwen_GR00T
+            instructions, _ = Qwen_GR00T._generate_explicit_cot(self, batch_images, instructions, **kwargs)
+
         # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
         instructions = (
             self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
@@ -414,16 +419,21 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
         if batch_images is None or instructions is None:
             raise ValueError("predict_action requires either examples or batch_images+instructions")
 
-        # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-
         train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
         if train_obs_image_size is None:
             train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
         if train_obs_image_size:
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        cot_mode = str(kwargs.get("cot_mode", self.config.framework.get("cot_mode", "none"))).lower()
+        if cot_mode == "explicit":
+            from laravla.model.framework.laravla import Qwen_GR00T
+            instructions, _ = Qwen_GR00T._generate_explicit_cot(self, batch_images, instructions, **kwargs)
+
+        # Match training: generate CoT from the original instruction, then add state for action prediction.
+        instructions = (
+            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
+        )
 
         instructions = self._append_action_prompt(instructions)
 
