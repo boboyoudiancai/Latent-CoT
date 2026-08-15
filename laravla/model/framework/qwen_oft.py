@@ -230,6 +230,75 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
             out.append(f"{text}{suffix}".strip())
         return out
 
+    @staticmethod
+    def _normalize_generated_cot(generated_cot: List[str]) -> List[str]:
+        normalized = []
+        for cot in generated_cot:
+            cot = (cot or "").strip()
+            if "@" in cot:
+                cot = "@ " + cot.split("@", 1)[1].strip()
+            normalized.append(cot)
+        return normalized
+
+    @classmethod
+    def _condition_on_generated_cot(cls, instructions: List[str], generated_cot: List[str]) -> List[str]:
+        if len(instructions) != len(generated_cot):
+            raise ValueError("Generated CoT batch size must match the instruction batch size")
+
+        conditioned = []
+        for instruction, cot in zip(instructions, cls._normalize_generated_cot(generated_cot)):
+            instruction = (instruction or "").strip()
+            if instruction and cot and instruction[-1] not in ".!?":
+                instruction += "."
+            conditioned.append(f"{instruction} {cot}".strip())
+        return conditioned
+
+    def _build_explicit_action_inputs(
+        self,
+        batch_images: List[List[Image.Image]],
+        instructions: List[str],
+        generated_cot: List[str],
+        state=None,
+    ):
+        if not (len(batch_images) == len(instructions) == len(generated_cot)):
+            raise ValueError("Images, instructions, and generated CoT must have the same batch size")
+
+        cot_texts = self._normalize_generated_cot(generated_cot)
+        action_prompts = [""] * len(instructions)
+        if state is not None:
+            action_prompts = self.add_discretized_state_to_instruction(action_prompts, state)
+        action_prompts = self._append_action_prompt(action_prompts)
+
+        messages = []
+        for imgs, instruction, cot, action_prompt in zip(
+            batch_images, instructions, cot_texts, action_prompts
+        ):
+            user_content = [{"type": "image", "image": img} for img in imgs]
+            user_content.append({"type": "text", "text": (instruction or "").strip()})
+            messages.append(
+                [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": [{"type": "text", "text": cot}]},
+                    {"role": "user", "content": [{"type": "text", "text": action_prompt}]},
+                ]
+            )
+
+        processor = self.qwen_vl_interface.processor
+        old_padding_side = processor.tokenizer.padding_side
+        processor.tokenizer.padding_side = "right"
+        try:
+            qwen_inputs = processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                padding=True,
+                add_generation_prompt=False,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        finally:
+            processor.tokenizer.padding_side = old_padding_side
+        return qwen_inputs.to(self.qwen_vl_interface.model.device)
+
     def _mask_action_prompt_labels(self, qwen_inputs) -> None:
         labels = qwen_inputs.get("labels", None)
         input_ids = qwen_inputs.get("input_ids", None)
@@ -257,11 +326,19 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
             if start is not None:
                 labels[row_idx, start:] = IGNORE_INDEX
 
-    def _run_qwen(self, batch_images, instructions, compute_vlm_loss: bool, use_iterative_forward: bool = True):
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
-            images=batch_images,
-            instructions=instructions,
-        )
+    def _run_qwen(
+        self,
+        batch_images,
+        instructions,
+        compute_vlm_loss: bool,
+        use_iterative_forward: bool = True,
+        qwen_inputs=None,
+    ):
+        if qwen_inputs is None:
+            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+                images=batch_images,
+                instructions=instructions,
+            )
         if compute_vlm_loss:
             self._mask_action_prompt_labels(qwen_inputs)
         else:
@@ -286,6 +363,22 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
 
         model_inputs = dict(qwen_inputs)
         model_inputs.pop("img_next_mask", None)
+        model_inputs["use_cache"] = False
+        if not compute_vlm_loss:
+            backbone = getattr(self.qwen_vl_interface.model, "model", None)
+            if backbone is None:
+                raise RuntimeError("QwenOFT requires a Qwen backbone at qwen_vl_interface.model.model")
+            model_inputs.pop("labels", None)
+            model_inputs.pop("logits_to_keep", None)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                backbone_outputs = backbone(
+                    **model_inputs,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+            return backbone_outputs.last_hidden_state, None, qwen_inputs
+
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
                 **model_inputs,
@@ -328,18 +421,25 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
         )  # List[ndarray (1, state_dim)] or None
 
         cot_mode = str(self.config.framework.get("cot_mode", "none")).lower()
+        explicit_action_inputs = None
         if self.training_stage != "reasoning_only" and cot_mode == "explicit":
             from laravla.model.framework.laravla import Qwen_GR00T
-            instructions, _ = Qwen_GR00T._generate_explicit_cot(self, batch_images, instructions, **kwargs)
-
-        # Optionally prepend discretised proprioceptive state tokens to each instruction (π₀.5 style).
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-
-        append_action_prompt = self.training_stage != "reasoning_only"
-        if append_action_prompt:
-            instructions = self._append_action_prompt(instructions)
+            generated_cot, _ = Qwen_GR00T._generate_explicit_cot(self, batch_images, instructions, **kwargs)
+            explicit_action_inputs = self._build_explicit_action_inputs(
+                batch_images=batch_images,
+                instructions=instructions,
+                generated_cot=generated_cot,
+                state=state,
+            )
+        else:
+            # Optionally append discretised proprioceptive state tokens to each instruction (π₀.5 style).
+            instructions = (
+                self.add_discretized_state_to_instruction(instructions, state)
+                if state is not None
+                else instructions
+            )
+            if self.training_stage != "reasoning_only":
+                instructions = self._append_action_prompt(instructions)
 
         # Step 1: QWenVL input format
         compute_vlm_loss = self.training_stage == "reasoning_only" or (
@@ -350,6 +450,7 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
             instructions=instructions,
             compute_vlm_loss=compute_vlm_loss,
             use_iterative_forward=True,
+            qwen_inputs=explicit_action_inputs,
         )
 
         result = {}
@@ -426,16 +527,23 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
         cot_mode = str(kwargs.get("cot_mode", self.config.framework.get("cot_mode", "none"))).lower()
+        explicit_action_inputs = None
         if cot_mode == "explicit":
             from laravla.model.framework.laravla import Qwen_GR00T
-            instructions, _ = Qwen_GR00T._generate_explicit_cot(self, batch_images, instructions, **kwargs)
-
-        # Match training: generate CoT from the original instruction, then add state for action prediction.
-        instructions = (
-            self.add_discretized_state_to_instruction(instructions, state) if state is not None else instructions
-        )
-
-        instructions = self._append_action_prompt(instructions)
+            generated_cot, _ = Qwen_GR00T._generate_explicit_cot(self, batch_images, instructions, **kwargs)
+            explicit_action_inputs = self._build_explicit_action_inputs(
+                batch_images=batch_images,
+                instructions=instructions,
+                generated_cot=generated_cot,
+                state=state,
+            )
+        else:
+            instructions = (
+                self.add_discretized_state_to_instruction(instructions, state)
+                if state is not None
+                else instructions
+            )
+            instructions = self._append_action_prompt(instructions)
 
         # Step 1: QWenVL input format
         use_iterative_forward = bool(kwargs.get("use_iterative_forward", False))
@@ -444,6 +552,7 @@ class Qwenvl_OFT(LatentAnalysisMixin, baseframework):
             instructions=instructions,
             compute_vlm_loss=False,
             use_iterative_forward=use_iterative_forward,
+            qwen_inputs=explicit_action_inputs,
         )
 
         # Step 4: Action Expert Forward and Loss
