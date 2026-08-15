@@ -27,7 +27,7 @@ import wandb
 import yaml
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 from transformers import get_scheduler
@@ -53,9 +53,13 @@ def build_accelerator(cfg) -> Accelerator:
     global accelerator
     grad_acc_steps = _gradient_accumulation_steps(cfg)
     deepspeed_plugin = DeepSpeedPlugin(gradient_accumulation_steps=grad_acc_steps)
+    gradient_accumulation_plugin = GradientAccumulationPlugin(
+        num_steps=grad_acc_steps,
+        sync_each_batch=True,
+    )
     accelerator = Accelerator(
         deepspeed_plugin=deepspeed_plugin,
-        gradient_accumulation_steps=grad_acc_steps,
+        gradient_accumulation_plugin=gradient_accumulation_plugin,
     )
     accelerator.print(accelerator.state)
     return accelerator
