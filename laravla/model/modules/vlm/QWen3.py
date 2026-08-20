@@ -13,8 +13,20 @@ from torch.nn.utils.rnn import pad_sequence
 from laravla.training.trainer_utils import initialize_overwatch
 
 logger = initialize_overwatch(__name__)
-BASE_PROMPT='Robot task reasoning: first output the Subtask to preform next, then output the BBox of target object, then generate the Motion Reasoning. Instruction:'
+BASE_PROMPT = (
+    "Robot task reasoning: first output the Subtask to perform next, then output the BBox "
+    "of the active object, then describe the current Spatial State of the gripper, active "
+    "object, and task reference, and finally generate the Motion Reasoning. Instruction:"
+)
 IGNORE_INDEX = -100
+
+
+def format_reasoning_prompt(instruction: str) -> str:
+    """Use one user prompt for explicit-CoT and latent-reasoning stages."""
+    instruction = (instruction or "").strip()
+    if instruction.startswith(BASE_PROMPT):
+        return instruction
+    return f"{BASE_PROMPT} {instruction}".strip()
 
 IMAGE_TOKEN_INDEX = 151655
 VIDEO_TOKEN_INDEX = 151656
@@ -858,8 +870,7 @@ class _QWen3_VL_Interface(nn.Module):
         for sample_idx, (imgs, instruction) in enumerate(zip(images, instructions)):
             content = [{"type": "image", "image": img} for img in imgs]
 
-            base_prompt = BASE_PROMPT
-            prompt = f"{base_prompt} {instruction}"
+            prompt = format_reasoning_prompt(instruction)
 
             if action_tokens is not None and isinstance(action_tokens, (list, tuple)) and sample_idx < len(action_tokens):
                 act_text = action_tokens[sample_idx] or ""

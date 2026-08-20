@@ -95,10 +95,17 @@ class M1Inference:
         # ---- latent reasoning prompt formatting config (strict alignment) ----
         self.enable_latent_reasoning = bool(enable_latent_reasoning)
         self.cot_mode = str(cot_mode)
-        self.thinking_token_count = int(thinking_token_count) if int(thinking_token_count) > 0 else 3
+        latent_cfg = ((model_config.get("framework", {}) or {}).get("latent_reasoning", {}) or {})
+        bridge_cfg = (
+            (((model_config.get("datasets", {}) or {}).get("vla_data", {}) or {}).get("bridge_reasoning", {}) or {})
+        )
+        self.thinking_token_count = (
+            int(thinking_token_count)
+            if int(thinking_token_count) > 0
+            else self._infer_thinking_token_count(bridge_cfg, latent_cfg)
+        )
         self.img_next_count = int(img_next_count) if int(img_next_count) > 0 else 16
 
-        latent_cfg = ((model_config.get("framework", {}) or {}).get("latent_reasoning", {}) or {})
         self._thinking_token = str(latent_cfg.get("thinking_token", "<|thinking|>"))
         self._start_of_thinking_token = str(latent_cfg.get("start_of_thinking_token", "<|start_of_thinking|>"))
         self._end_of_thinking_token = str(latent_cfg.get("end_of_thinking_token", "<|end_of_thinking|>"))
@@ -127,12 +134,38 @@ class M1Inference:
     def format_instruction(self, instruction: str) -> str:
         return self._format_instruction_with_latent(instruction)
 
+    @staticmethod
+    def _infer_thinking_token_count(bridge_cfg: dict, latent_cfg: dict) -> int:
+        """Infer the Stage-4 latent width used during training."""
+        default_order = ("SUBTASK", "BBOX", "REASON")
+        raw_order = bridge_cfg.get("component_order", default_order)
+        if isinstance(raw_order, str):
+            raw_order = raw_order.split(",")
+        order = [str(tag).strip().upper() for tag in raw_order]
+
+        include_bbox = bool(bridge_cfg.get("include_bbox", True))
+        stage = int(bridge_cfg.get("stage", 4))
+        latent_tags = set()
+        if stage >= 2:
+            latent_tags.add("SUBTASK")
+        if stage >= 3:
+            latent_tags.add("BBOX")
+        if stage >= 4:
+            latent_tags.update({"SPATIAL", "REASON"})
+        counts = bridge_cfg.get("tag2think_count") or latent_cfg.get("tag2think_count") or {}
+        total = 0
+        for tag in order:
+            if tag not in latent_tags:
+                continue
+            if tag == "BBOX" and not include_bbox:
+                continue
+            total += max(1, int(counts.get(tag, 1)))
+        return total or 3
+
     def _thinking_span(self) -> str:
         """
-        Implicit evaluation uses fixed "stage4" behavior:
-          - Always insert exactly 3 <|thinking|> tokens by default (SUBTASK+BBOX+REASON),
-            unless overridden via `thinking_token_count`.
-          - No extra tags/order/stage logic to keep behavior minimal and aligned.
+        The default count is inferred from the checkpoint's Stage-4 component
+        order and tag2think_count; `thinking_token_count` can override it.
         """
         body = self._thinking_token * int(self.thinking_token_count)
         return f"{self._start_of_thinking_token}{body}{self._end_of_thinking_token}"

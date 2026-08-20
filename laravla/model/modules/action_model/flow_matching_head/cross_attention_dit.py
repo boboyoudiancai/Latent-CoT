@@ -168,7 +168,7 @@ class BasicTransformerBlock(nn.Module):
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
+            attention_mask=encoder_attention_mask,
         )
         if self.final_dropout:
             attn_output = self.final_dropout(attn_output)
@@ -267,6 +267,7 @@ class DiT(ModelMixin, ConfigMixin):
         film_first_k: int = 0,
         return_all_hidden_states: bool = False,
         reasoning_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -293,7 +294,7 @@ class DiT(ModelMixin, ConfigMixin):
                     hidden_states,
                     attention_mask=None,
                     encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=None,
+                    encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                     reasoning_mask=reasoning_mask,
                 )

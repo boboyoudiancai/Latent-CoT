@@ -371,6 +371,10 @@ class SimCoTTrainingModule(nn.Module):
             return None
 
         autocast_enabled = self.dtype in {torch.float16, torch.bfloat16}
+        record_component_losses = bool(
+            train_step is None
+            or (int(train_step) + 1) % max(1, int(self.args.logging_frequency)) == 0
+        )
         with torch.autocast("cuda", dtype=self.dtype, enabled=autocast_enabled):
             decoder_out = self.decoder(
                 latent_prefix=decoder_batch.latent_prefix.to(dtype=self.dtype),
@@ -378,6 +382,7 @@ class SimCoTTrainingModule(nn.Module):
                 target_input_ids=decoder_batch.target_input_ids,
                 target_labels=decoder_batch.target_labels,
                 target_attention_mask=decoder_batch.target_attention_mask,
+                return_per_sample_loss=record_component_losses,
             )
 
         decoder_loss = decoder_out["loss"]
@@ -396,6 +401,13 @@ class SimCoTTrainingModule(nn.Module):
             "decoder_loss": decoder_loss,
             "decoder_loss_weight": decoder_loss.detach().new_tensor(decoder_loss_weight),
         }
+        if record_component_losses:
+            result.update(
+                decoder_component_losses(
+                    per_sample_loss=decoder_out["per_sample_loss"],
+                    tags=decoder_batch.tags,
+                )
+            )
         if action_token_loss is not None:
             result["action_token_loss"] = action_token_loss
         return result
@@ -521,6 +533,12 @@ def build_original_decoder_qwen_model(
     except ValueError as exc:
         if "device_map" not in str(exc):
             raise
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    model.config.use_cache = False
     model.train()
     return model
 
@@ -591,6 +609,24 @@ def merge_loss_dicts(
     return current
 
 
+def decoder_component_losses(
+    per_sample_loss: torch.Tensor,
+    tags: Sequence[str],
+) -> Dict[str, torch.Tensor]:
+    """Average decoder sample losses by reasoning component."""
+    if per_sample_loss.ndim != 1 or per_sample_loss.shape[0] != len(tags):
+        raise ValueError(
+            f"per_sample_loss shape {tuple(per_sample_loss.shape)} does not match {len(tags)} tags"
+        )
+    result: Dict[str, torch.Tensor] = {}
+    normalized_tags = [str(tag).strip().upper() for tag in tags]
+    for tag in ("SUBTASK", "BBOX", "SPATIAL", "REASON"):
+        indices = [idx for idx, sample_tag in enumerate(normalized_tags) if sample_tag == tag]
+        if indices:
+            result[f"decoder_{tag.lower()}_loss"] = per_sample_loss[indices].mean()
+    return result
+
+
 def average_loss_dict(loss_dict: Dict[str, torch.Tensor], count: int) -> Dict[str, torch.Tensor]:
     denom = max(1, int(count))
     return {key: value / denom for key, value in loss_dict.items()}
@@ -655,6 +691,9 @@ def run_decoder_eval(
     module.eval()
     total_losses: List[float] = []
     decoder_losses: List[float] = []
+    component_decoder_losses: Dict[str, List[float]] = {
+        tag: [] for tag in ("subtask", "bbox", "spatial", "reason")
+    }
     action_token_losses: List[float] = []
     samples: List[Dict[str, Any]] = []
     data_iter = iter(dataloader)
@@ -677,8 +716,13 @@ def run_decoder_eval(
             target_input_ids=decoder_batch.target_input_ids,
             target_labels=decoder_batch.target_labels,
             target_attention_mask=decoder_batch.target_attention_mask,
+            return_per_sample_loss=True,
         )
         decoder_loss = decoder_out["loss"]
+        batch_component_losses = decoder_component_losses(
+            per_sample_loss=decoder_out["per_sample_loss"],
+            tags=decoder_batch.tags,
+        )
         total_loss = decoder_loss_weight * decoder_loss
         action_token_loss = outputs.get("loss")
         if (
@@ -689,6 +733,12 @@ def run_decoder_eval(
             total_loss = total_loss + args.action_token_loss_weight * action_token_loss
             action_token_losses.append(float(action_token_loss.detach().cpu()))
         decoder_losses.append(float(decoder_loss.detach().cpu()))
+        for tag in component_decoder_losses:
+            key = f"decoder_{tag}_loss"
+            if key in batch_component_losses:
+                component_decoder_losses[tag].append(
+                    float(batch_component_losses[key].detach().cpu())
+                )
         total_losses.append(float(total_loss.detach().cpu()))
 
         if len(samples) < args.eval_samples:
@@ -729,6 +779,10 @@ def run_decoder_eval(
         "step": step,
         "eval_total_loss": eval_total_loss,
         "eval_decoder_loss": eval_decoder_loss,
+        **{
+            f"eval_decoder_{tag}_loss": mean_or_none(losses)
+            for tag, losses in component_decoder_losses.items()
+        },
         "decoder_loss_weight": decoder_loss_weight,
         "eval_action_token_loss": eval_action_token_loss,
         "num_eval_batches": len(total_losses),
@@ -780,7 +834,7 @@ def decoder_loss_weight_for_step(args: argparse.Namespace, step: int | None) -> 
 
 def normalize_component_order(value: Any) -> List[str]:
     if value is None:
-        return ["BBOX", "SUBTASK", "REASON"]
+        return ["SUBTASK", "BBOX", "SPATIAL", "REASON"]
     if isinstance(value, str):
         return [x.strip().upper() for x in value.split(",") if x.strip()]
     out: List[str] = []
@@ -789,7 +843,7 @@ def normalize_component_order(value: Any) -> List[str]:
             out.extend([x.strip().upper() for x in item.split(",") if x.strip()])
         else:
             out.append(str(item).strip().upper())
-    return [x for x in out if x in {"BBOX", "SUBTASK", "REASON"}]
+    return [x for x in out if x in {"BBOX", "SUBTASK", "SPATIAL", "REASON"}]
 
 
 def save_joint_checkpoint(

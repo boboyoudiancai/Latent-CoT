@@ -52,6 +52,9 @@ def _gradient_accumulation_steps(cfg) -> int:
 def build_accelerator(cfg) -> Accelerator:
     global accelerator
     grad_acc_steps = _gradient_accumulation_steps(cfg)
+    enable_mixed_precision = bool(
+        getattr(getattr(cfg, "trainer", None), "enable_mixed_precision_training", False)
+    )
     deepspeed_plugin = DeepSpeedPlugin(gradient_accumulation_steps=grad_acc_steps)
     gradient_accumulation_plugin = GradientAccumulationPlugin(
         num_steps=grad_acc_steps,
@@ -60,6 +63,7 @@ def build_accelerator(cfg) -> Accelerator:
     accelerator = Accelerator(
         deepspeed_plugin=deepspeed_plugin,
         gradient_accumulation_plugin=gradient_accumulation_plugin,
+        mixed_precision="bf16" if enable_mixed_precision else "no",
     )
     accelerator.print(accelerator.state)
     return accelerator
@@ -237,8 +241,6 @@ def sync_bridge_reasoning_to_framework(cfg):
     if tag2think is not None:
         _set("tag2think_count", tag2think)
 
-    _set("compute_language_loss", True)
-
 
 class LaRA_VLA_Trainer(TrainerUtils):
     def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
@@ -284,6 +286,22 @@ class LaRA_VLA_Trainer(TrainerUtils):
             else None
         )
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
+
+        if bool(getattr(self.config.trainer, "enable_gradient_checkpointing", False)):
+            qwen_interface = getattr(self.model, "qwen_vl_interface", None)
+            qwen_model = getattr(qwen_interface, "model", None)
+            if qwen_model is None or not hasattr(qwen_model, "gradient_checkpointing_enable"):
+                raise RuntimeError(
+                    "trainer.enable_gradient_checkpointing=true, but the Qwen backbone "
+                    "does not support gradient checkpointing"
+                )
+            qwen_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            if hasattr(qwen_model, "enable_input_require_grads"):
+                qwen_model.enable_input_require_grads()
+            qwen_model.config.use_cache = False
+            logger.info("Enabled Qwen gradient checkpointing (use_reentrant=False, use_cache=False)")
 
         #  print model trainable parameters:
         self.print_trainable_parameters(self.model)

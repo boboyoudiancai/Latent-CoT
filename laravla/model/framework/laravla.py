@@ -28,6 +28,7 @@ IGNORE_INDEX = -100
 from laravla.model.framework.base_framework import baseframework
 from laravla.model.framework.latent_analysis_mixin import LatentAnalysisMixin
 from laravla.model.modules.vlm import get_vlm_model
+from laravla.model.modules.vlm.QWen3 import format_reasoning_prompt
 from laravla.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from laravla.model.modules.action_model.fast_ActionHeader import Fast_Action_Tokenizer
 from laravla.training.trainer_utils.trainer_tools import resize_images
@@ -105,6 +106,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         cot_solutions = None
         use_generated_cot = False
         if cot_mode == "explicit":
+            if self.training_stage == "reasoning_only":
+                instructions = [format_reasoning_prompt(instruction) for instruction in instructions]
             explicit_cot_cfg = self.config.framework.get("explicit_cot", {})
             action_input = str(explicit_cot_cfg.get("action_input", "gt")).lower()
             use_generated_cot = action_input in {"generated", "model", "sampled"}
@@ -167,12 +170,16 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
                 vlm_loss = qwenvl_outputs.loss if hasattr(qwenvl_outputs, 'loss') else None
 
+        backbone_attention_mask = qwen_inputs.get("attention_mask")
+        if backbone_attention_mask is not None:
+            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
+
         explicit_cot_cfg = self.config.framework.get("explicit_cot", {})
         action_context_max_tokens = int(explicit_cot_cfg.get("action_context_max_tokens", 0) or 0)
         if action_context_max_tokens > 0:
-            last_hidden = self._limit_action_context(
+            last_hidden, backbone_attention_mask = self._limit_action_context(
                 last_hidden=last_hidden,
-                attention_mask=qwen_inputs.get("attention_mask"),
+                attention_mask=backbone_attention_mask,
                 max_tokens=action_context_max_tokens,
             )
 
@@ -240,6 +247,11 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 )
                 actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
                 last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+                action_attention_mask = (
+                    backbone_attention_mask.repeat(repeated_diffusion_steps, 1)
+                    if backbone_attention_mask is not None
+                    else None
+                )
                 
                 state_repeated = None
                 if state is not None:
@@ -257,6 +269,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     last_hidden_repeated,
                     actions_target_repeated,
                     state_repeated,
+                    encoder_attention_mask=action_attention_mask,
                 )
 
                 result["action_loss"] = action_loss
@@ -277,6 +290,11 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 )
                 actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
                 last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+                action_attention_mask = (
+                    backbone_attention_mask.repeat(repeated_diffusion_steps, 1)
+                    if backbone_attention_mask is not None
+                    else None
+                )
                 
                 state_repeated = None
                 if state is not None:
@@ -293,6 +311,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     last_hidden_repeated,
                     actions_target_repeated,
                     state_repeated,
+                    encoder_attention_mask=action_attention_mask,
                 )
 
             result["action_loss"] = action_loss
@@ -456,15 +475,18 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         last_hidden: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         max_tokens: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if max_tokens <= 0 or last_hidden.shape[1] <= max_tokens:
-            return last_hidden
+            return last_hidden, attention_mask
 
         if attention_mask is None or attention_mask.shape[:2] != last_hidden.shape[:2]:
-            return last_hidden[:, :max_tokens, :]
+            hidden = last_hidden[:, :max_tokens, :]
+            mask = torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
+            return hidden, mask
 
         mask = attention_mask.to(device=last_hidden.device, dtype=torch.bool)
         selected = []
+        selected_masks = []
         head_tokens = max_tokens // 2
         tail_tokens = max_tokens - head_tokens
         for sample_hidden, sample_mask in zip(last_hidden, mask):
@@ -474,10 +496,14 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     [valid_hidden[:head_tokens], valid_hidden[-tail_tokens:]],
                     dim=0,
                 )
-            if valid_hidden.shape[0] < max_tokens:
-                valid_hidden = F.pad(valid_hidden, (0, 0, 0, max_tokens - valid_hidden.shape[0]))
+            valid_count = valid_hidden.shape[0]
+            if valid_count < max_tokens:
+                valid_hidden = F.pad(valid_hidden, (0, 0, 0, max_tokens - valid_count))
             selected.append(valid_hidden)
-        return torch.stack(selected, dim=0)
+            selected_masks.append(
+                torch.arange(max_tokens, device=last_hidden.device) < valid_count
+            )
+        return torch.stack(selected, dim=0), torch.stack(selected_masks, dim=0)
 
     def _get_fast_action_processor(self):
         if self._fast_action_processor is not None:
@@ -696,7 +722,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         messages = []
         for imgs, instruction in zip(batch_images, instructions):
             content = [{"type": "image", "image": img} for img in imgs]
-            content.append({"type": "text", "text": instruction})
+            content.append({"type": "text", "text": format_reasoning_prompt(instruction)})
             messages.append([{"role": "user", "content": content}])
 
         old_padding_side = processor.tokenizer.padding_side
@@ -788,6 +814,9 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             qwen_inputs.pop("labels", None)
         else:
             qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
+        backbone_attention_mask = qwen_inputs.get("attention_mask")
+        if backbone_attention_mask is not None:
+            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
 
         # Step 2: Forward pass
         if use_iterative_forward:
@@ -822,6 +851,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             pred_actions = self.action_model.predict_action(
                 last_hidden,
                 state,
+                encoder_attention_mask=backbone_attention_mask,
             )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()

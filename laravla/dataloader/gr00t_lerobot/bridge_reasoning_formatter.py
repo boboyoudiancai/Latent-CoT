@@ -26,20 +26,16 @@ class BridgeReasoningFormatter:
     component_order: Optional[Sequence[str]] = None
 
     def __post_init__(self):
-        default_order = ("BBOX", "SUBTASK", "REASON")
+        default_order = ("SUBTASK", "BBOX", "SPATIAL", "REASON")
         if self.component_order:
             normalized = []
             for tag in self.component_order:
                 name = str(tag).strip().upper()
-                if name in {"BBOX", "SUBTASK", "REASON"} and name not in normalized:
+                if name in {"BBOX", "SUBTASK", "SPATIAL", "REASON"} and name not in normalized:
                     normalized.append(name)
             self.component_order = tuple(normalized) if normalized else default_order
         else:
             self.component_order = default_order
-
-    def _full_image_bbox(self) -> np.ndarray:
-        # Normalized xyxy covering the full image.
-        return np.array([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
 
     def _bbox_to_str(self, bbox: np.ndarray, confidence: float) -> str:
         coords = " ".join(f"{float(x):.4f}" for x in bbox.tolist())
@@ -50,6 +46,7 @@ class BridgeReasoningFormatter:
     def format(self, instruction: str, sample: dict) -> str:
         instruction = (instruction or "").strip()
         subtask = sample.get("cot_subtask", "") or ""
+        spatial = sample.get("cot_spatial", "") or ""
         reasoning = sample.get("cot_reasoning", "") or ""
         bbox = sample.get("bbox")
         bbox_valid = bool(sample.get("bbox_valid", False))
@@ -57,6 +54,14 @@ class BridgeReasoningFormatter:
         bbox2 = sample.get("bbox2")
         bbox2_valid = bool(sample.get("bbox2_valid", False))
         action_tokens = sample.get("action_tokens", "") or ""
+
+        requires_bbox = self.include_bbox and "BBOX" in self.component_order
+        if requires_bbox and (not bbox_valid or bbox is None):
+            raise ValueError(
+                "Missing required BBox annotation "
+                f"(episode_index={sample.get('episode_index', 'unknown')}, "
+                f"frame_index={sample.get('frame_index', 'unknown')})"
+            )
 
         # Keep numeric bbox fields intact in the sample; only combine inside the formatter
         # when we need to render explicit BBox text (e.g., stage 1 / stage 2).
@@ -74,6 +79,7 @@ class BridgeReasoningFormatter:
             return self._format_stage0(
                 instruction=instruction,
                 subtask=subtask,
+                spatial=spatial,
                 reasoning=reasoning,
                 bbox=bbox if bbox_valid else None,
                 bbox_conf=bbox_conf,
@@ -83,6 +89,7 @@ class BridgeReasoningFormatter:
             return self._format_stage1(
                 instruction=instruction,
                 subtask=subtask,
+                spatial=spatial,
                 reasoning=reasoning,
                 bbox=bbox_explicit_value,
                 bbox_conf=bbox_conf,
@@ -90,7 +97,7 @@ class BridgeReasoningFormatter:
             )
         # Stage >=2: progressively convert components into thinking tokens
         else:
-            bbox_for_latent = bbox if bbox_valid and bbox is not None else self._full_image_bbox()
+            bbox_for_latent = bbox if bbox_valid else None
             if (
                 self.include_bbox
                 and bbox_valid
@@ -102,6 +109,7 @@ class BridgeReasoningFormatter:
             return self._format_latent(
                 instruction=instruction,
                 subtask=subtask,
+                spatial=spatial,
                 reasoning=reasoning,
                 bbox=bbox_for_latent,
                 bbox_conf=bbox_conf,
@@ -112,6 +120,7 @@ class BridgeReasoningFormatter:
         self,
         instruction: str,
         subtask: str,
+        spatial: str,
         reasoning: str,
         bbox: Optional[np.ndarray],
         bbox_conf: float,
@@ -125,22 +134,18 @@ class BridgeReasoningFormatter:
         self,
         instruction: str,
         subtask: str,
+        spatial: str,
         reasoning: str,
         bbox: Optional[np.ndarray],
         bbox_conf: float,
         action_tokens: str,
     ) -> str:
         parts = []
-        for tag, value in self._iter_components(bbox, subtask, reasoning):
+        for tag, value in self._iter_components(bbox, subtask, spatial, reasoning):
             parts.append(self._format_explicit_tag(tag, value, bbox_conf))
 
         body = " ".join(parts) if parts else ""
-        if instruction:
-            delimiter = " @ "
-            body_text = body if body else ""
-            text = f"{instruction}.{delimiter}{body_text}"
-        else:
-            text = body
+        text = f"@ {body}".strip()
         # 注意：action tokens 不再拼进自然语言文本；后续会在模型输入构造阶段以 token 级 suffix 追加。
         text = self._append_img_next(text, before_action=False)
         return text.strip()
@@ -149,13 +154,14 @@ class BridgeReasoningFormatter:
         self,
         instruction: str,
         subtask: str,
+        spatial: str,
         reasoning: str,
         bbox: Optional[np.ndarray],
         bbox_conf: float,
         latent_tags: set,
         action_tokens: str,
     ) -> str:
-        segments = list(self._iter_components(bbox, subtask, reasoning))
+        segments = list(self._iter_components(bbox, subtask, spatial, reasoning))
 
         tag_counts = self.tag2think_count or {}
         thinking_body = ""
@@ -197,7 +203,7 @@ class BridgeReasoningFormatter:
         if stage >= 3:
             latent_tags.add("BBOX")
         if stage >= 4:
-            latent_tags.add("REASON")
+            latent_tags.update({"SPATIAL", "REASON"})
         return latent_tags
 
     def _format_explicit_tag(self, tag: str, value, bbox_conf: float) -> str:
@@ -205,6 +211,8 @@ class BridgeReasoningFormatter:
             return f"Subtask: {value}."
         if tag == "REASON":
             return f"Reasoning: {value}"
+        if tag == "SPATIAL":
+            return f"Spatial: {value}"
         if tag == "BBOX":
             if isinstance(value, (list, tuple)) and len(value) > 0:
                 parts = []
@@ -236,10 +244,12 @@ class BridgeReasoningFormatter:
         self,
         bbox: Optional[np.ndarray],
         subtask: str,
+        spatial: str,
         reasoning: str,
     ):
         order: Tuple[str, ...] = self.component_order  # type: ignore[assignment]
         subtask = subtask or ""
+        spatial = spatial or ""
         reasoning = reasoning or ""
         for tag in order:
             if tag == "BBOX":
@@ -248,6 +258,9 @@ class BridgeReasoningFormatter:
             elif tag == "SUBTASK":
                 if subtask:
                     yield ("SUBTASK", subtask)
+            elif tag == "SPATIAL":
+                if spatial:
+                    yield ("SPATIAL", spatial)
             elif tag == "REASON":
                 if reasoning:
                     yield ("REASON", reasoning)

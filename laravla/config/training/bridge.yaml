@@ -44,11 +44,12 @@ datasets:
       thinking_token: "<|thinking|>"
       start_token: "<|start_of_thinking|>"
       end_token: "<|end_of_thinking|>"
-      component_order: [BBOX, SUBTASK, REASON]
+      component_order: [SUBTASK, BBOX, SPATIAL, REASON]
       tag2think_count:
         SUBTASK: 1
         REASON: 1
         BBOX: 1
+        SPATIAL: 1
       vlm_loss_weight: 1
     ecot:
       scheduled_stage: 4   # for config validation logging
@@ -125,7 +126,7 @@ trainer:
     enable: false
     interval_steps: 1
     max_samples: 32
-    max_latents: 3
+    max_latents: 4
     max_img_next: 32
     # Dedupe: keep only unique instructions to reduce repeated samples.
     # - unique_in_batch: ensures we don't log the same instruction twice within one trigger.

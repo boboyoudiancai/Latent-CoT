@@ -249,6 +249,7 @@ class FlowmatchingActionHead(nn.Module):
         state: Optional[torch.Tensor] = None,
         reasoning_mask: Optional[torch.Tensor] = None,
         img_next_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
     ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
@@ -284,6 +285,7 @@ class FlowmatchingActionHead(nn.Module):
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
+            encoder_attention_mask=encoder_attention_mask,
             timestep=t_discretized,
         )
         pred = self.action_decoder(model_output)
@@ -299,6 +301,7 @@ class FlowmatchingActionHead(nn.Module):
         state: Optional[torch.Tensor] = None,
         reasoning_mask: Optional[torch.Tensor] = None,
         img_next_mask: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
@@ -336,6 +339,7 @@ class FlowmatchingActionHead(nn.Module):
             model_output = self.model(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
+                encoder_attention_mask=encoder_attention_mask,
                 timestep=timesteps_tensor,
             )
             pred = self.action_decoder(model_output)

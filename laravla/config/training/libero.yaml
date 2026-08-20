@@ -27,14 +27,17 @@ datasets:
     bridge_annotations:
       cot_path: "annotations/episode_dense_captions_full.jsonl"
       bbox_path: "annotations/episode_sam3_bboxes_from_dino_final.jsonl"
+      spatial_cot_path: "annotations/episode_spatial_cot.jsonl"
       fast_tokenizer_name: "physical-intelligence/fast"
       steps_cache_path: null
       write_steps_cache: true
       filters:
         require_cot_episode: false
+        require_spatial_cot_episode: true
         require_bbox_episode: true
         min_episode_bbox_coverage: 0.0
         require_bbox_step: false
+        require_spatial_cot_step: true
         include_task_indices: null
         exclude_task_indices: null
 
@@ -47,11 +50,12 @@ datasets:
       thinking_token: "<|thinking|>"
       start_token: "<|start_of_thinking|>"
       end_token: "<|end_of_thinking|>"
-      component_order: [SUBTASK, BBOX, REASON]
+      component_order: [SUBTASK, BBOX, SPATIAL, REASON]
       tag2think_count:
         SUBTASK: 1
         REASON: 1
         BBOX: 1
+        SPATIAL: 1
 
 framework:
   name: "QwenGR00T"

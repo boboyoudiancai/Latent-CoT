@@ -191,10 +191,16 @@ class LeRobotSingleDataset(Dataset):
         filters_cfg = bridge_filter_cfg or self.bridge_annotation_cfg.get("filters") if isinstance(self.bridge_annotation_cfg, dict) else None
         self.bridge_filter_cfg = filters_cfg or {}
         self.require_cot_episode = bool(self.bridge_filter_cfg.get("require_cot_episode", False))
+        self.require_spatial_cot_episode = bool(
+            self.bridge_filter_cfg.get("require_spatial_cot_episode", False)
+        )
         self.require_bbox_episode = bool(self.bridge_filter_cfg.get("require_bbox_episode", False))
         min_cov = self.bridge_filter_cfg.get("min_episode_bbox_coverage")
         self.min_episode_bbox_coverage = float(min_cov) if min_cov is not None else None
         self.require_bbox_step = bool(self.bridge_filter_cfg.get("require_bbox_step", False))
+        self.require_spatial_cot_step = bool(
+            self.bridge_filter_cfg.get("require_spatial_cot_step", False)
+        )
         def _normalize_task_indices(value):
             if value is None:
                 return None
@@ -207,8 +213,14 @@ class LeRobotSingleDataset(Dataset):
         annotations_dir = self.dataset_path / "annotations"
         default_cot_file = annotations_dir / "episode_dense_captions_full_ep0-20.jsonl"
         default_bbox_file = annotations_dir / "episode_sam3_bboxes_final.jsonl"
+        default_spatial_cot_file = annotations_dir / "episode_spatial_cot.jsonl"
         cot_override = (self.bridge_annotation_cfg or {}).get("cot_path") if isinstance(self.bridge_annotation_cfg, dict) else None
         bbox_override = (self.bridge_annotation_cfg or {}).get("bbox_path") if isinstance(self.bridge_annotation_cfg, dict) else None
+        spatial_cot_override = (
+            (self.bridge_annotation_cfg or {}).get("spatial_cot_path")
+            if isinstance(self.bridge_annotation_cfg, dict)
+            else None
+        )
 
         self.steps_cache_override: Path | None = None
         self.steps_cache_override_is_dir: bool = False
@@ -239,17 +251,23 @@ class LeRobotSingleDataset(Dataset):
 
         cot_file = _resolve_path(cot_override, default_cot_file)
         bbox_file = _resolve_path(bbox_override, default_bbox_file)
+        spatial_cot_file = _resolve_path(spatial_cot_override, default_spatial_cot_file)
 
-        if (cot_file and cot_file.exists()) or (bbox_file and bbox_file.exists()):
+        if any(path and path.exists() for path in (cot_file, bbox_file, spatial_cot_file)):
             try:
                 self.bridge_annotations = BridgeAnnotations(
                     dataset_root=self.dataset_path,
                     cot_path=cot_file if cot_file and cot_file.exists() else None,
                     bbox_path=bbox_file if bbox_file and bbox_file.exists() else None,
+                    spatial_cot_path=(
+                        spatial_cot_file if spatial_cot_file and spatial_cot_file.exists() else None
+                    ),
                 )
                 print(
                     f"Loaded BridgeAnnotations for dataset `{self.dataset_name}` "
-                    f"(cot={bool(cot_file and cot_file.exists())}, bbox={bool(bbox_file and bbox_file.exists())})"
+                    f"(cot={bool(cot_file and cot_file.exists())}, "
+                    f"bbox={bool(bbox_file and bbox_file.exists())}, "
+                    f"spatial_cot={bool(spatial_cot_file and spatial_cot_file.exists())})"
                 )
             except Exception as e:
                 print(f"Warning: failed to load BridgeAnnotations for {self.dataset_name}: {e}")
@@ -279,7 +297,7 @@ class LeRobotSingleDataset(Dataset):
                 tag2think = dict(tag2think)
             if component_order is not None:
                 # Accept both YAML list form and CLI comma-separated string form.
-                # Example CLI: --datasets.vla_data.bridge_reasoning.component_order "SUBTASK,BBOX,REASON"
+                # Example CLI: component_order="SUBTASK,BBOX,SPATIAL,REASON"
                 if isinstance(component_order, str):
                     component_order = [t.strip() for t in component_order.split(",") if t.strip()]
                 else:
@@ -611,9 +629,11 @@ class LeRobotSingleDataset(Dataset):
             "delete_pause_frame": self.delete_pause_frame,
             "dataset_name": self.dataset_name,
             "require_cot_episode": getattr(self, "require_cot_episode", False),
+            "require_spatial_cot_episode": getattr(self, "require_spatial_cot_episode", False),
             "require_bbox_episode": getattr(self, "require_bbox_episode", False),
             "min_episode_bbox_coverage": getattr(self, "min_episode_bbox_coverage", None),
             "require_bbox_step": getattr(self, "require_bbox_step", False),
+            "require_spatial_cot_step": getattr(self, "require_spatial_cot_step", False),
             "list_filter":"true",
         }
         # Create a hash of the configuration
@@ -626,6 +646,11 @@ class LeRobotSingleDataset(Dataset):
         bbox_info = self.bridge_annotations.get_step_bbox(trajectory_id, base_index)
         return bbox_info is not None and bbox_info.valid
 
+    def _bridge_step_has_spatial_cot(self, trajectory_id: int, base_index: int) -> bool:
+        if not (self.bridge_annotations is not None and self.require_spatial_cot_step):
+            return True
+        return bool(self.bridge_annotations.get_step_spatial_cot(trajectory_id, base_index))
+
     def _get_all_steps_single_process(self) -> list[tuple[int, int]]:
         """Original single-process implementation as fallback."""
         all_steps: list[tuple[int, int]] = []
@@ -637,15 +662,19 @@ class LeRobotSingleDataset(Dataset):
         
         bridge_filter_active = self.bridge_annotations is not None and (
             self.require_cot_episode
+            or self.require_spatial_cot_episode
             or self.require_bbox_episode
             or self.min_episode_bbox_coverage is not None
             or self.require_bbox_step
+            or self.require_spatial_cot_step
         )
         task_filter_active = self.include_task_indices is not None or self.exclude_task_indices is not None
         skipped_bridge_no_cot = 0
+        skipped_bridge_no_spatial_cot = 0
         skipped_bridge_no_bbox = 0
         skipped_bridge_low_cov = 0
         skipped_bridge_step_no_bbox = 0
+        skipped_bridge_step_no_spatial_cot = 0
         skipped_task_include = 0
         skipped_task_exclude = 0
 
@@ -699,6 +728,14 @@ class LeRobotSingleDataset(Dataset):
                     skipped_trajectories += 1
                     trajectory_skipped = True
                     continue
+                if (
+                    self.require_spatial_cot_episode
+                    and not self.bridge_annotations.has_spatial_cot(trajectory_id)
+                ):
+                    skipped_bridge_no_spatial_cot += 1
+                    skipped_trajectories += 1
+                    trajectory_skipped = True
+                    continue
                 if self.require_bbox_episode or self.min_episode_bbox_coverage is not None:
                     coverage = self.bridge_annotations.episode_bbox_coverage(trajectory_id)
                 if self.require_bbox_episode:
@@ -737,11 +774,17 @@ class LeRobotSingleDataset(Dataset):
                         if self.require_bbox_step and not self._bridge_step_has_bbox(trajectory_id, base_index):
                             skipped_bridge_step_no_bbox += 1
                             continue
+                        if not self._bridge_step_has_spatial_cot(trajectory_id, base_index):
+                            skipped_bridge_step_no_spatial_cot += 1
+                            continue
                         all_steps.append((trajectory_id, base_index))
             else:
                 for base_index in range(trajectory_length):
                     if self.require_bbox_step and not self._bridge_step_has_bbox(trajectory_id, base_index):
                         skipped_bridge_step_no_bbox += 1
+                        continue
+                    if not self._bridge_step_has_spatial_cot(trajectory_id, base_index):
+                        skipped_bridge_step_no_spatial_cot += 1
                         continue
                     all_steps.append((trajectory_id, base_index))
                     
@@ -751,9 +794,11 @@ class LeRobotSingleDataset(Dataset):
             print(
                 "Bridge filter summary: "
                 f"skip_no_cot={skipped_bridge_no_cot}, "
+                f"skip_no_spatial_cot={skipped_bridge_no_spatial_cot}, "
                 f"skip_no_bbox_episode={skipped_bridge_no_bbox}, "
                 f"skip_low_bbox_cov={skipped_bridge_low_cov}, "
-                f"skip_bbox_steps={skipped_bridge_step_no_bbox}"
+                f"skip_bbox_steps={skipped_bridge_step_no_bbox}, "
+                f"skip_spatial_cot_steps={skipped_bridge_step_no_spatial_cot}"
             )
         if task_filter_active:
             print(
@@ -1102,6 +1147,8 @@ class LeRobotSingleDataset(Dataset):
             image=images,
             image_next=images_next,
             image_next_fallback=fallback,
+            episode_index=int(trajectory_id),
+            frame_index=int(base_index),
             language=language,
             lang=language,
         )
@@ -1125,6 +1172,10 @@ class LeRobotSingleDataset(Dataset):
             sample["cot_subtask"] = cot.subtask if cot else ""
             sample["cot_reasoning"] = cot.reasoning if cot else ""
             sample["cot_gripper_state"] = cot.gripper_state if cot else None
+            sample["cot_spatial"] = self.bridge_annotations.get_step_spatial_cot(
+                trajectory_id, base_index
+            )
+            sample["spatial_cot_available"] = bool(sample["cot_spatial"])
 
             bbox_info = self.bridge_annotations.get_step_bbox(trajectory_id, base_index)
             if bbox_info is not None and bbox_info.valid:
@@ -1156,6 +1207,8 @@ class LeRobotSingleDataset(Dataset):
             sample["cot_subtask"] = ""
             sample["cot_reasoning"] = ""
             sample["cot_gripper_state"] = None
+            sample["cot_spatial"] = ""
+            sample["spatial_cot_available"] = False
             sample["bbox"] = np.zeros(4, dtype=np.float32)
             sample["bbox_valid"] = False
             sample["bbox_confidence"] = 0.0

@@ -13,6 +13,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 IGNORE_INDEX = -100
 
@@ -91,6 +92,7 @@ class OneBlockLatentTextDecoder(nn.Module):
         target_labels: torch.Tensor,
         target_attention_mask: Optional[torch.Tensor] = None,
         latent_prefix_attention_mask: Optional[torch.Tensor] = None,
+        return_per_sample_loss: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Predict target labels from latent prefix plus teacher-forced tokens."""
         if latent_prefix.ndim != 3:
@@ -187,7 +189,13 @@ class OneBlockLatentTextDecoder(nn.Module):
         else:
             loss = target_logits.new_zeros(())
 
-        return {"loss": loss, "logits": target_logits}
+        result = {
+            "loss": loss,
+            "logits": target_logits,
+        }
+        if return_per_sample_loss:
+            result["per_sample_loss"] = per_sample_loss.detach()
+        return result
 
     @torch.no_grad()
     def greedy_decode(
@@ -306,6 +314,7 @@ class FullQwenLatentTextDecoder(nn.Module):
         target_labels: torch.Tensor,
         target_attention_mask: Optional[torch.Tensor] = None,
         latent_prefix_attention_mask: Optional[torch.Tensor] = None,
+        return_per_sample_loss: bool = False,
     ) -> Dict[str, torch.Tensor]:
         if latent_prefix.ndim != 3:
             raise ValueError(f"latent_prefix must be [B, P, H], got {tuple(latent_prefix.shape)}")
@@ -339,19 +348,62 @@ class FullQwenLatentTextDecoder(nn.Module):
         target_embeds = self.input_embeddings(target_input_ids)
         inputs_embeds = torch.cat([latent_prefix, target_embeds], dim=1)
         attention_mask = torch.cat([latent_prefix_attention_mask, target_attention_mask], dim=1)
-        prefix_labels = target_labels.new_full((batch_size, prefix_len), IGNORE_INDEX)
-        labels = torch.cat([prefix_labels, target_labels], dim=1)
 
-        outputs = self.model(
+        outputs = self.model.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            labels=labels,
             use_cache=False,
             return_dict=True,
         )
-        logits = outputs.logits[:, prefix_len - 1 : -1, :]
-        loss = outputs.loss if outputs.loss is not None else logits.new_zeros(())
-        return {"loss": loss, "logits": logits}
+        predictor_hidden = outputs.last_hidden_state[:, prefix_len - 1 : -1, :]
+        valid_token_count = target_labels.ne(IGNORE_INDEX).sum().clamp_min(1)
+
+        def chunk_loss(hidden: torch.Tensor, chunk_labels: torch.Tensor) -> torch.Tensor:
+            chunk_logits = self.model.lm_head(hidden).float()
+            return F.cross_entropy(
+                chunk_logits.reshape(-1, self.vocab_size),
+                chunk_labels.reshape(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="sum",
+            )
+
+        # The FP32 full-vocabulary CE tensor is the decoder's memory peak. Checkpointing
+        # small sample chunks preserves the exact token-mean loss while bounding that peak.
+        loss_sum = predictor_hidden.new_zeros((), dtype=torch.float32)
+        chunk_size = 2
+        for start in range(0, batch_size, chunk_size):
+            hidden_chunk = predictor_hidden[start : start + chunk_size]
+            labels_chunk = target_labels[start : start + chunk_size]
+            if self.training and torch.is_grad_enabled():
+                loss_sum = loss_sum + checkpoint(
+                    chunk_loss,
+                    hidden_chunk,
+                    labels_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                loss_sum = loss_sum + chunk_loss(hidden_chunk, labels_chunk)
+        loss = loss_sum / valid_token_count
+        result = {
+            "loss": loss,
+            "logits": None,
+        }
+        if return_per_sample_loss:
+            per_sample_loss = predictor_hidden.new_zeros((batch_size,), dtype=torch.float32)
+            with torch.no_grad():
+                for sample_idx in range(batch_size):
+                    valid_mask = target_labels[sample_idx].ne(IGNORE_INDEX)
+                    if valid_mask.any():
+                        sample_logits = self.model.lm_head(
+                            predictor_hidden[sample_idx, valid_mask]
+                        ).float()
+                        per_sample_loss[sample_idx] = F.cross_entropy(
+                            sample_logits,
+                            target_labels[sample_idx, valid_mask],
+                            reduction="mean",
+                        )
+            result["per_sample_loss"] = per_sample_loss
+        return result
 
     @torch.no_grad()
     def greedy_decode(
@@ -440,6 +492,7 @@ def format_decoder_targets_from_example(
 ) -> List[Dict[str, str]]:
     """Build explicit component texts in the same order as the latent span."""
     subtask = example.get("cot_subtask", "") or ""
+    spatial = example.get("cot_spatial", "") or ""
     reasoning = example.get("cot_reasoning", "") or ""
     bbox_valid = bool(example.get("bbox_valid", False))
     bbox = example.get("bbox")
@@ -451,16 +504,21 @@ def format_decoder_targets_from_example(
         tag = str(raw_tag).strip().upper()
         if tag == "SUBTASK" and subtask:
             out.append({"tag": tag, "text": f"Subtask: {subtask}."})
+        elif tag == "SPATIAL" and spatial:
+            out.append({"tag": tag, "text": f"Spatial: {spatial}"})
         elif tag == "REASON" and reasoning:
             out.append({"tag": tag, "text": f"Reasoning: {reasoning}"})
         elif tag == "BBOX" and include_bbox:
+            if not bbox_valid or bbox is None:
+                raise ValueError(
+                    "Missing required BBox annotation for decoder target "
+                    f"(episode_index={example.get('episode_index', 'unknown')}, "
+                    f"frame_index={example.get('frame_index', 'unknown')})"
+                )
             boxes = []
-            if bbox_valid and bbox is not None:
-                boxes.append(_bbox_to_text(bbox))
+            boxes.append(_bbox_to_text(bbox))
             if bbox_valid and bbox2_valid and bbox2 is not None:
                 boxes.append(_bbox_to_text(bbox2))
-            if not boxes:
-                boxes.append(_bbox_to_text([0.0, 0.0, 1.0, 1.0]))
             joined = " ".join(f"[{box}]" for box in boxes)
             out.append({"tag": tag, "text": f"BBox: {joined}."})
     return out

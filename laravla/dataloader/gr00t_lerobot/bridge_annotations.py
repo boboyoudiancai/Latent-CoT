@@ -38,6 +38,7 @@ class BridgeAnnotations:
         dataset_root: Path,
         cot_path: Optional[Path] = None,
         bbox_path: Optional[Path] = None,
+        spatial_cot_path: Optional[Path] = None,
     ) -> None:
         self.dataset_root = Path(dataset_root)
 
@@ -46,19 +47,25 @@ class BridgeAnnotations:
             cot_path = annotations_dir / "episode_dense_captions_full_final.jsonl"
         if bbox_path is None:
             bbox_path = annotations_dir / "episode_sam3_bboxes_final.jsonl"
+        if spatial_cot_path is None:
+            spatial_cot_path = annotations_dir / "episode_spatial_cot.jsonl"
 
         self.cot_path = Path(cot_path)
         self.bbox_path = Path(bbox_path)
+        self.spatial_cot_path = Path(spatial_cot_path)
 
         self._cot: Dict[int, Dict[int, StepCoT]] = {}
         self._bbox: Dict[int, Dict[int, StepBBox]] = {}
         self._bbox2: Dict[int, Dict[int, StepBBox]] = {}
+        self._spatial_cot: Dict[int, Dict[int, str]] = {}
         self._episode_num_steps: Dict[int, int] = {}
 
         if self.cot_path.exists():
             self._load_cot()
         if self.bbox_path.exists():
             self._load_bbox()
+        if self.spatial_cot_path.exists():
+            self._load_spatial_cot()
 
     # --------------------------------------------------------------------- #
     # Loading utilities
@@ -149,6 +156,29 @@ class BridgeAnnotations:
                 if per_step2:
                     self._bbox2[ep] = per_step2
 
+    def _load_spatial_cot(self) -> None:
+        with self.spatial_cot_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                ep = int(obj.get("episode_index"))
+                steps = obj.get("steps", {})
+                per_step: Dict[int, str] = {}
+                for k, value in steps.items():
+                    try:
+                        step_idx = int(k)
+                    except Exception:
+                        continue
+                    if isinstance(value, dict):
+                        value = value.get("spatial_cot", value.get("spatial", ""))
+                    spatial_cot = str(value or "").strip()
+                    if spatial_cot:
+                        per_step[step_idx] = spatial_cot
+                if per_step:
+                    self._spatial_cot[ep] = per_step
+
     # --------------------------------------------------------------------- #
     # Public API
     # --------------------------------------------------------------------- #
@@ -163,6 +193,10 @@ class BridgeAnnotations:
             return False
         return any(v.valid for v in per_step.values())
 
+    def has_spatial_cot(self, episode_index: int) -> bool:
+        """Return True if this episode has at least one spatial-CoT step."""
+        return bool(self._spatial_cot.get(episode_index))
+
     def get_step_cot(self, episode_index: int, step_index: int) -> Optional[StepCoT]:
         """Return CoT annotation for (episode, step) or None."""
         return self._cot.get(episode_index, {}).get(step_index)
@@ -174,6 +208,10 @@ class BridgeAnnotations:
     def get_step_bbox2(self, episode_index: int, step_index: int) -> Optional[StepBBox]:
         """Return optional secondary bbox annotation for (episode, step) or None."""
         return self._bbox2.get(episode_index, {}).get(step_index)
+
+    def get_step_spatial_cot(self, episode_index: int, step_index: int) -> str:
+        """Return spatial CoT for (episode, step), or an empty string."""
+        return self._spatial_cot.get(episode_index, {}).get(step_index, "")
 
     def episode_bbox_coverage(self, episode_index: int) -> Optional[float]:
         """
