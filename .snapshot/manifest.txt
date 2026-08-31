@@ -1,0 +1,10 @@
+snapshot_version=1
+snapshot_date=20260831
+snapshot_time=2026-08-31T11:18:26+08:00
+source_host=gpu8017
+source_repo=/share/home/u25505/apps/wangbo/LatentVLA/LaRA-VLA
+source_branch=main
+source_head=3ed54bc761250d29e87eece2fd4818bf1b1fe5e3
+source_status_sha256=a1a84b08c7a58c054830877017364fabbcaf9901a52fab45de807ef703b28c5b
+tracked_snapshot_files=110
+excluded=playground,results,tmp,checkpoints,datasets,models,wandb,logs,caches
