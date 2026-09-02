@@ -110,13 +110,31 @@ class _QWen3_VL_Interface(nn.Module):
         else:
             self.img_next_token_id = None
 
-        # img_next EMA target vision encoder (teacher)
+        # ImageNext target vision encoder (EMA by default for compatibility).
         self.enable_img_next = bool(enable_img_next)
         self.use_img_next_teacher = bool(img_next_cfg.get("use_teacher", True)) if enable_img_next else False
+        self.img_next_teacher_update_mode = str(
+            img_next_cfg.get("teacher_update_mode", "ema")
+        ).strip().lower()
+        if self.img_next_teacher_update_mode not in {"ema", "frozen"}:
+            raise ValueError(
+                "framework.img_next.teacher_update_mode must be 'ema' or 'frozen', "
+                f"got {self.img_next_teacher_update_mode!r}"
+            )
         self.img_next_ema_momentum = 0.999
         self.visual_ema: Optional[nn.Module] = None
         if self.enable_img_next and self.use_img_next_teacher:
             self._init_img_next_visual_ema()
+
+    def train(self, mode: bool = True):
+        result = super().train(mode)
+        teacher_visual = getattr(self, "visual_ema", None)
+        if (
+            teacher_visual is not None
+            and getattr(self, "img_next_teacher_update_mode", "ema") == "frozen"
+        ):
+            teacher_visual.eval()
+        return result
 
     def _get_student_visual(self) -> Optional[nn.Module]:
         """
@@ -141,9 +159,12 @@ class _QWen3_VL_Interface(nn.Module):
             self.visual_ema = copy.deepcopy(student_visual)
             self.visual_ema.requires_grad_(False)
             self.visual_ema.eval()
-            logger.info("[img_next_ema] Initialized EMA teacher vision encoder")
+            logger.info(
+                "[img_next_teacher] Initialized target vision encoder "
+                f"(update_mode={self.img_next_teacher_update_mode})"
+            )
         except Exception as exc:
-            logger.warning(f"[img_next_ema] Failed to init EMA teacher vision encoder: {exc}")
+            logger.warning(f"[img_next_teacher] Failed to init target vision encoder: {exc}")
             self.visual_ema = None
 
     @torch.no_grad()
@@ -153,6 +174,8 @@ class _QWen3_VL_Interface(nn.Module):
           ema = m * ema + (1-m) * student
         """
         if (not self.enable_img_next) or (not getattr(self, "use_img_next_teacher", True)):
+            return
+        if getattr(self, "img_next_teacher_update_mode", "ema") == "frozen":
             return
         student_visual = self._get_student_visual()
         teacher_visual = getattr(self, "visual_ema", None)

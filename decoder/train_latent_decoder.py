@@ -127,7 +127,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--img_next_use_teacher",
         action="store_true",
-        help="Use the EMA vision encoder as the detached ImageNext target.",
+        help="Use a detached vision encoder as the ImageNext target.",
+    )
+    parser.add_argument(
+        "--img_next_teacher_update_mode",
+        default="ema",
+        choices=["ema", "frozen"],
+        help="Update the detached ImageNext target encoder by EMA or keep its initial copy frozen.",
     )
     parser.add_argument(
         "--img_next_count",
@@ -590,6 +596,7 @@ def apply_stage4_base_init_contract(cfg, args: argparse.Namespace):
         "framework.img_next.enable": bool(args.enable_img_next),
         "framework.img_next.loss_weight": float(args.img_next_loss_weight) if args.enable_img_next else 0.0,
         "framework.img_next.use_teacher": bool(args.img_next_use_teacher) if args.enable_img_next else False,
+        "framework.img_next.teacher_update_mode": str(args.img_next_teacher_update_mode),
         "framework.img_next.res": int(args.img_next_res),
         "framework.cot_mode_flags.enable_latent_reasoning": True,
         "framework.cot_mode_flags.emit_explicit_cot": False,
@@ -745,6 +752,7 @@ def apply_runtime_overrides(cfg, args: argparse.Namespace):
     cfg.framework.img_next.enable = bool(args.enable_img_next)
     cfg.framework.img_next.loss_weight = float(args.img_next_loss_weight) if args.enable_img_next else 0.0
     cfg.framework.img_next.use_teacher = bool(args.img_next_use_teacher) if args.enable_img_next else False
+    cfg.framework.img_next.teacher_update_mode = str(args.img_next_teacher_update_mode)
     cfg.framework.img_next.res = int(args.img_next_res)
     cfg.datasets.vla_data.bridge_reasoning.include_img_next = bool(args.enable_img_next)
     cfg.datasets.vla_data.bridge_reasoning.img_next_count = int(args.img_next_count)
