@@ -116,7 +116,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--enable_img_next",
         action="store_true",
-        help="Add ImageNext tokens and train their next-frame visual-feature prediction loss.",
+        help="Add ImageNext tokens and train their configured visual-feature alignment loss.",
     )
     parser.add_argument(
         "--img_next_loss_weight",
@@ -136,6 +136,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Update the detached ImageNext target encoder by EMA or keep its initial copy frozen.",
     )
     parser.add_argument(
+        "--img_next_teacher_type",
+        default="qwen",
+        choices=["qwen", "vjepa2_1_vit_large_384"],
+        help="Visual encoder used to produce ImageNext supervision targets.",
+    )
+    parser.add_argument(
+        "--img_next_target_frame",
+        default="next",
+        choices=["current", "next"],
+        help="Frame encoded by the ImageNext target teacher.",
+    )
+    parser.add_argument(
+        "--img_next_teacher_repo",
+        default=None,
+        help="Local Hugging Face model directory for V-JEPA 2.1 ViT-L/16 384.",
+    )
+    parser.add_argument("--img_next_teacher_input_size", type=int, default=384)
+    parser.add_argument(
         "--img_next_count",
         type=int,
         default=16,
@@ -154,6 +172,15 @@ def main() -> None:
             raise ValueError("--img_next_loss_weight must be positive when ImageNext is enabled")
         if args.img_next_res <= 0:
             raise ValueError("--img_next_res must be positive when ImageNext is enabled")
+        if args.img_next_teacher_type == "vjepa2_1_vit_large_384":
+            if args.img_next_target_frame != "current":
+                raise ValueError("V-JEPA 2.1 teacher requires --img_next_target_frame current")
+            if args.img_next_teacher_update_mode != "frozen":
+                raise ValueError("V-JEPA 2.1 teacher requires --img_next_teacher_update_mode frozen")
+            if not args.img_next_teacher_repo:
+                raise ValueError("V-JEPA 2.1 teacher requires --img_next_teacher_repo")
+            if args.img_next_teacher_input_size <= 0:
+                raise ValueError("--img_next_teacher_input_size must be positive")
     gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     args.gradient_accumulation_steps = gradient_accumulation_steps
     if args.decoder_loss_weight_final is None and args.decoder_loss_weight_schedule != "constant":
@@ -597,6 +624,10 @@ def apply_stage4_base_init_contract(cfg, args: argparse.Namespace):
         "framework.img_next.loss_weight": float(args.img_next_loss_weight) if args.enable_img_next else 0.0,
         "framework.img_next.use_teacher": bool(args.img_next_use_teacher) if args.enable_img_next else False,
         "framework.img_next.teacher_update_mode": str(args.img_next_teacher_update_mode),
+        "framework.img_next.teacher_type": str(args.img_next_teacher_type),
+        "framework.img_next.target_frame": str(args.img_next_target_frame),
+        "framework.img_next.teacher_repo": args.img_next_teacher_repo,
+        "framework.img_next.teacher_input_size": int(args.img_next_teacher_input_size),
         "framework.img_next.res": int(args.img_next_res),
         "framework.cot_mode_flags.enable_latent_reasoning": True,
         "framework.cot_mode_flags.emit_explicit_cot": False,
@@ -753,6 +784,10 @@ def apply_runtime_overrides(cfg, args: argparse.Namespace):
     cfg.framework.img_next.loss_weight = float(args.img_next_loss_weight) if args.enable_img_next else 0.0
     cfg.framework.img_next.use_teacher = bool(args.img_next_use_teacher) if args.enable_img_next else False
     cfg.framework.img_next.teacher_update_mode = str(args.img_next_teacher_update_mode)
+    cfg.framework.img_next.teacher_type = str(args.img_next_teacher_type)
+    cfg.framework.img_next.target_frame = str(args.img_next_target_frame)
+    cfg.framework.img_next.teacher_repo = args.img_next_teacher_repo
+    cfg.framework.img_next.teacher_input_size = int(args.img_next_teacher_input_size)
     cfg.framework.img_next.res = int(args.img_next_res)
     cfg.datasets.vla_data.bridge_reasoning.include_img_next = bool(args.enable_img_next)
     cfg.datasets.vla_data.bridge_reasoning.img_next_count = int(args.img_next_count)

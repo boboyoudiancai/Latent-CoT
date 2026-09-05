@@ -110,9 +110,21 @@ class _QWen3_VL_Interface(nn.Module):
         else:
             self.img_next_token_id = None
 
-        # ImageNext target vision encoder (EMA by default for compatibility).
+        # ImageNext target vision encoder (Qwen EMA by default for compatibility).
         self.enable_img_next = bool(enable_img_next)
         self.use_img_next_teacher = bool(img_next_cfg.get("use_teacher", True)) if enable_img_next else False
+        self.img_next_teacher_type = str(img_next_cfg.get("teacher_type", "qwen")).strip().lower()
+        self.img_next_target_frame = str(img_next_cfg.get("target_frame", "next")).strip().lower()
+        if self.img_next_teacher_type not in {"qwen", "vjepa2_1_vit_large_384"}:
+            raise ValueError(
+                "framework.img_next.teacher_type must be 'qwen' or "
+                f"'vjepa2_1_vit_large_384', got {self.img_next_teacher_type!r}"
+            )
+        if self.img_next_target_frame not in {"current", "next"}:
+            raise ValueError(
+                "framework.img_next.target_frame must be 'current' or 'next', "
+                f"got {self.img_next_target_frame!r}"
+            )
         self.img_next_teacher_update_mode = str(
             img_next_cfg.get("teacher_update_mode", "ema")
         ).strip().lower()
@@ -123,8 +135,15 @@ class _QWen3_VL_Interface(nn.Module):
             )
         self.img_next_ema_momentum = 0.999
         self.visual_ema: Optional[nn.Module] = None
+        self.img_next_target_projection: Optional[nn.Module] = None
+        # Deliberately not an nn.Module child: the external 300M teacher must not
+        # enter the LaRA optimizer or be duplicated in every saved checkpoint.
+        self.img_next_external_teacher = None
         if self.enable_img_next and self.use_img_next_teacher:
-            self._init_img_next_visual_ema()
+            if self.img_next_teacher_type == "qwen":
+                self._init_img_next_visual_ema()
+            else:
+                self._init_img_next_vjepa_teacher(img_next_cfg)
 
     def train(self, mode: bool = True):
         result = super().train(mode)
@@ -134,7 +153,61 @@ class _QWen3_VL_Interface(nn.Module):
             and getattr(self, "img_next_teacher_update_mode", "ema") == "frozen"
         ):
             teacher_visual.eval()
+        external_teacher = getattr(self, "img_next_external_teacher", None)
+        if external_teacher is not None:
+            external_teacher.encoder.eval()
         return result
+
+    def _init_img_next_vjepa_teacher(self, img_next_cfg) -> None:
+        from .jepa_teacher import VJEPA21ViTLargeTeacher
+
+        if self.img_next_target_frame != "current":
+            raise ValueError("V-JEPA 2.1 ImageNext supervision requires target_frame='current'")
+        if self.img_next_teacher_update_mode != "frozen":
+            raise ValueError("V-JEPA 2.1 ImageNext teacher must use teacher_update_mode='frozen'")
+        teacher_repo_value = img_next_cfg.get("teacher_repo", "")
+        teacher_repo = str(teacher_repo_value).strip() if teacher_repo_value else ""
+        if not teacher_repo:
+            raise ValueError(
+                "V-JEPA 2.1 teacher requires framework.img_next.teacher_repo"
+            )
+        teacher_input_size = int(img_next_cfg.get("teacher_input_size", 384))
+        self.img_next_external_teacher = VJEPA21ViTLargeTeacher(
+            teacher_repo=teacher_repo,
+            input_size=teacher_input_size,
+        )
+        hidden_size = int(self.model.config.text_config.hidden_size)
+        self.img_next_target_projection = nn.Linear(
+            hidden_size,
+            self.img_next_external_teacher.embed_dim,
+            bias=False,
+        )
+        logger.info(
+            "[img_next_teacher] Initialized frozen V-JEPA 2.1 ViT-L teacher "
+            f"(target_frame=current, input_size={teacher_input_size}, "
+            f"student_dim={hidden_size}, target_dim={self.img_next_external_teacher.embed_dim})"
+        )
+
+    def project_img_next_prediction(self, prediction: torch.Tensor) -> torch.Tensor:
+        projection = getattr(self, "img_next_target_projection", None)
+        return projection(prediction) if projection is not None else prediction
+
+    def get_external_img_next_target(
+        self,
+        images,
+        device: torch.device,
+        dtype: torch.dtype,
+        target_tokens: int,
+    ) -> torch.Tensor:
+        teacher = getattr(self, "img_next_external_teacher", None)
+        if teacher is None:
+            raise RuntimeError("external ImageNext teacher is not initialized")
+        return teacher.encode(
+            images=images,
+            device=device,
+            dtype=dtype,
+            target_tokens=target_tokens,
+        )
 
     def _get_student_visual(self) -> Optional[nn.Module]:
         """
@@ -174,6 +247,8 @@ class _QWen3_VL_Interface(nn.Module):
           ema = m * ema + (1-m) * student
         """
         if (not self.enable_img_next) or (not getattr(self, "use_img_next_teacher", True)):
+            return
+        if getattr(self, "img_next_teacher_type", "qwen") != "qwen":
             return
         if getattr(self, "img_next_teacher_update_mode", "ema") == "frozen":
             return
@@ -763,10 +838,18 @@ class _QWen3_VL_Interface(nn.Module):
     def load_state_dict(self, state_dict, strict: bool = True):
 
         if not getattr(self, "use_img_next_teacher", True):
-            pruned = {k: v for k, v in state_dict.items() if not k.startswith("visual_ema")}
+            pruned = {
+                k: v
+                for k, v in state_dict.items()
+                if not k.startswith("visual_ema")
+                and not k.startswith("img_next_target_projection")
+            }
             dropped = len(state_dict) - len(pruned)
             if dropped > 0:
-                logger.info(f"[load_state_dict] Dropped {dropped} visual_ema keys (use_img_next_teacher=False)")
+                logger.info(
+                    f"[load_state_dict] Dropped {dropped} ImageNext teacher-only keys "
+                    "(use_img_next_teacher=False)"
+                )
             state_dict = pruned
         return super().load_state_dict(state_dict, strict=strict)
 
