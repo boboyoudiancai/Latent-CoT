@@ -553,17 +553,30 @@ class SimCoTTrainingModule(nn.Module):
             and float(self.cfg.framework.img_next.loss_weight) > 0
         ):
             img_next_mask = qwen_inputs["input_ids"] == int(qwen_iface.img_next_token_id)
-            image_next = [example.get("image_next", None) for example in examples]
+            teacher_type = str(
+                getattr(self.cfg.framework.img_next, "teacher_type", "qwen")
+            ).strip().lower()
+            target_frame = str(
+                getattr(self.cfg.framework.img_next, "target_frame", "next")
+            ).strip().lower()
+            target_key = "image" if target_frame == "current" else "image_next"
+            target_images = [example.get(target_key, None) for example in examples]
             fallback_mask = torch.tensor(
-                [bool(example.get("image_next_fallback", False)) for example in examples],
+                [
+                    False
+                    if target_frame == "current"
+                    else bool(example.get("image_next_fallback", False))
+                    for example in examples
+                ],
                 device=outputs["hidden_states"].device,
             )
             outputs["img_next_loss"] = self.vlm_model._compute_img_next_loss(
                 outputs["hidden_states"],
-                image_next,
+                target_images,
                 img_next_mask,
                 fallback_mask,
                 target_res=int(self.cfg.framework.img_next.res),
+                teacher_type=teacher_type,
             )
 
         bridge_cfg = self.cfg.datasets.vla_data.bridge_reasoning
