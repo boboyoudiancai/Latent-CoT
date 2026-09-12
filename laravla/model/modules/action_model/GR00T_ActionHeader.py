@@ -235,6 +235,25 @@ class FlowmatchingActionHead(nn.Module):
         self.num_timestep_buckets = config.num_timestep_buckets
         self.config = config
 
+        self.state_dropout = float(config.get("state_dropout", 0.0) or 0.0)
+        if not 0.0 <= self.state_dropout <= 1.0:
+            raise ValueError(f"state_dropout must be in [0, 1], got {self.state_dropout}")
+
+    def _apply_state_dropout(self, state_features: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Drop the complete state token per sample without rescaling survivors."""
+        if (
+            state_features is None
+            or not self.training
+            or not torch.is_grad_enabled()
+            or self.state_dropout <= 0.0
+        ):
+            return state_features
+        keep = torch.rand(
+            (state_features.shape[0], 1, 1),
+            device=state_features.device,
+        ) >= self.state_dropout
+        return state_features * keep.to(dtype=state_features.dtype)
+
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
@@ -269,6 +288,7 @@ class FlowmatchingActionHead(nn.Module):
         action_features = self.action_encoder(noisy_trajectory, t_discretized)
 
         state_features = self.state_encoder(state) if state is not None else None
+        state_features = self._apply_state_dropout(state_features)
 
         if self.config.add_pos_embed:
             pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
@@ -315,6 +335,7 @@ class FlowmatchingActionHead(nn.Module):
         dt = 1.0 / num_steps
         
         state_features = self.state_encoder(state) if state is not None else None
+        state_features = self._apply_state_dropout(state_features)
 
         for t in range(num_steps):
             t_cont = t / float(num_steps)

@@ -184,7 +184,19 @@ def _run_episode(
         if replay_images is not None:
             replay_images.append(img)
 
-        response = model.step(images=[img, wrist_img], task_description=str(task_description), step=step)
+        state = np.concatenate(
+            (
+                obs["robot0_eef_pos"],
+                _quat2axisangle(obs["robot0_eef_quat"]),
+                obs["robot0_gripper_qpos"],
+            )
+        ).astype(np.float32, copy=False)
+        response = model.step(
+            images=[img, wrist_img],
+            task_description=str(task_description),
+            step=step,
+            state=state,
+        )
         raw_action = response["raw_action"]
         delta_action = np.concatenate(
             [

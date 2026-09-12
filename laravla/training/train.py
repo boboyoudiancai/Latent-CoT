@@ -525,10 +525,15 @@ class LaRA_VLA_Trainer(TrainerUtils):
             batch_images = [example["image"] for example in examples]
             instructions = [example["lang"] for example in examples]  # [B, str]
             actions = [example["action"] for example in examples]  # label
+            states = [example["state"] for example in examples] if "state" in examples[0] else None
 
             # Predict actions using the model
             output_dict = self.model.predict_action(
-                batch_images=batch_images, instructions=instructions, use_ddim=True, num_ddim_steps=20
+                batch_images=batch_images,
+                instructions=instructions,
+                state=states,
+                use_ddim=True,
+                num_ddim_steps=20,
             )
 
             normalized_actions = output_dict["normalized_actions"]  # B, T, D
@@ -658,6 +663,18 @@ def main(cfg) -> None:
     logger.info(f"[Implicit Reasoning] training_stage={training_stage}, flags={mode_flags}")
 
     sync_bridge_reasoning_to_framework(cfg)
+
+    raw_include_state = cfg.datasets.vla_data.get("include_state", False)
+    include_state = (
+        raw_include_state.strip().lower() in {"1", "true", "yes", "on"}
+        if isinstance(raw_include_state, str)
+        else bool(raw_include_state)
+    )
+    if include_state:
+        # Keep the saved config and constructed action head aligned with native LIBERO state.
+        cfg.framework.action_model.state_dim = 8
+        if cfg.framework.action_model.get("state_dropout", None) is None:
+            cfg.framework.action_model.state_dropout = 0.5
 
     # Validate ECoT configuration
     validate_ecot_config(cfg)

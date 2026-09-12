@@ -65,6 +65,27 @@ LE_ROBOT_STEPS_FILENAME = "meta/steps.pkl"
 EPSILON = 5e-4
 TASK_INDEX_KEY = "task_index"
 
+
+def concatenate_state_fields(data: dict, state_keys: list[str]) -> np.ndarray:
+    """Concatenate native LIBERO state fields into one [T, 8] array."""
+    parts = []
+    for key in state_keys:
+        if key not in data:
+            raise KeyError(f"Missing state field {key}; available keys: {sorted(data)}")
+        value = data[key]
+        if hasattr(value, "detach"):
+            value = value.detach().cpu().numpy()
+        value = np.asarray(value)
+        if value.ndim == 1:
+            value = value[:, None]
+        if value.ndim != 2:
+            raise ValueError(f"State field {key} must be [T, D], got {value.shape}")
+        parts.append(value)
+    state = np.concatenate(parts, axis=1).astype(np.float32, copy=False)
+    if state.shape[1] != 8:
+        raise ValueError(f"LIBERO state must have 8 dimensions, got {state.shape}")
+    return state
+
 def calculate_dataset_statistics(parquet_paths: list[Path]) -> dict:
     """Calculate the dataset statistics of all columns for a list of parquet files."""
     # Dataset statistics
@@ -1152,6 +1173,9 @@ class LeRobotSingleDataset(Dataset):
             language=language,
             lang=language,
         )
+
+        if getattr(self, "include_state", False):
+            sample["state"] = concatenate_state_fields(data, self.modality_keys["state"])
 
         if self.fast_action_tokenizer is not None and self.include_action_tokens:
             try:

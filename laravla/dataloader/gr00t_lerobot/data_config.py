@@ -498,22 +498,38 @@ class Libero4in1DataConfig:
         }
         return modality_configs
 
-    def transform(self):
-        transforms = [
-            # action transforms
-            StateActionToTensor(apply_to=self.action_keys),
-            StateActionTransform(
-            apply_to=self.action_keys,
-            normalization_modes={
-                "action.x": "min_max",
-                "action.y": "min_max",
-                "action.z": "min_max",
-                "action.roll": "min_max",
-                "action.pitch": "min_max",
-                "action.yaw": "min_max",
-            },
-        ),
-        ]
+    def transform(self, include_state: bool = False, state_normalization: str = "q99"):
+        transforms = []
+        if include_state:
+            # Native LIBERO state: xyz, axis-angle, and two gripper qpos values.
+            transforms.extend(
+                [
+                    StateActionToTensor(apply_to=self.state_keys),
+                    StateActionTransform(
+                        apply_to=self.state_keys,
+                        normalization_modes={
+                            key: state_normalization for key in self.state_keys
+                        },
+                    ),
+                ]
+            )
+
+        transforms.extend(
+            [
+                StateActionToTensor(apply_to=self.action_keys),
+                StateActionTransform(
+                    apply_to=self.action_keys,
+                    normalization_modes={
+                        "action.x": "min_max",
+                        "action.y": "min_max",
+                        "action.z": "min_max",
+                        "action.roll": "min_max",
+                        "action.pitch": "min_max",
+                        "action.yaw": "min_max",
+                    },
+                ),
+            ]
+        )
 
         return ComposedModalityTransform(transforms=transforms)
 

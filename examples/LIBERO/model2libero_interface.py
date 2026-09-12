@@ -79,9 +79,25 @@ class M1Inference:
         self.model_config = model_config
         self.norm_stats = norm_stats
 
+        vla_cfg = ((model_config.get("datasets", {}) or {}).get("vla_data", {}) or {})
+        raw_include_state = vla_cfg.get("include_state", False)
+        self.include_state = (
+            raw_include_state.strip().lower() in {"1", "true", "yes", "on"}
+            if isinstance(raw_include_state, str)
+            else bool(raw_include_state)
+        )
+        self.state_norm_stats = None
+        self.state_normalization = str(vla_cfg.get("state_normalization", "q99") or "q99").lower()
+
         # Action unnormalization stats
         self.unnorm_key = M1Inference._check_unnorm_key(norm_stats, self.unnorm_key)
         self.action_norm_stats = norm_stats[self.unnorm_key]["action"]
+        if self.include_state:
+            self.state_norm_stats = norm_stats[self.unnorm_key].get("state")
+            if not self.state_norm_stats:
+                raise ValueError(
+                    "include_state=true but checkpoint has no state normalization statistics"
+                )
 
         # Action chunk size (future_action_window_size + 1)
         action_model_cfg = model_config["framework"]["action_model"]
@@ -200,6 +216,7 @@ class M1Inference:
         images, 
         task_description: Optional[str] = None,
         step: int = 0,
+        state=None,
         **kwargs
     ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         """
@@ -223,6 +240,10 @@ class M1Inference:
             "unnorm_key": self.unnorm_key,
             "do_sample": False,
         }
+        if self.include_state:
+            if state is None:
+                raise ValueError("This checkpoint requires state input, but step() received state=None")
+            vla_input["state"] = self._normalize_state_for_inference(state)
         if self.action_decode_mode == "diffusion":
             vla_input["use_ddim"] = self.use_ddim
             vla_input["num_ddim_steps"] = self.num_ddim_steps
@@ -264,6 +285,50 @@ class M1Inference:
         }
 
         return {"raw_action": raw_action}
+
+    def _normalize_state_for_inference(self, state: np.ndarray) -> np.ndarray:
+        """Normalize one LIBERO state and retain the [B, 1, D] action-head shape."""
+        values = np.asarray(state, dtype=np.float32)
+        if values.ndim == 1:
+            values = values[None, None, :]
+        elif values.ndim == 2:
+            values = values[None, :, :]
+        if values.ndim != 3 or values.shape[0] != 1 or values.shape[1] != 1:
+            raise ValueError(f"Expected one LIBERO state with shape [1,1,D], got {values.shape}")
+        if values.shape[-1] != 8:
+            raise ValueError(f"Expected 8-D LIBERO state, got {values.shape[-1]}")
+
+        if self.state_normalization == "q99":
+            low = np.asarray(self.state_norm_stats["q01"], dtype=np.float32)
+            high = np.asarray(self.state_norm_stats["q99"], dtype=np.float32)
+            if low.shape != (8,) or high.shape != (8,):
+                raise ValueError(f"State q99 statistics must be length 8, got {low.shape}, {high.shape}")
+            normalized = np.array(values, copy=True)
+            mask = low != high
+            normalized[..., mask] = 2.0 * (values[..., mask] - low[mask]) / (high[mask] - low[mask]) - 1.0
+            normalized[..., ~mask] = values[..., ~mask]
+            return np.clip(normalized, -1.0, 1.0)
+        if self.state_normalization == "min_max":
+            low = np.asarray(self.state_norm_stats["min"], dtype=np.float32)
+            high = np.asarray(self.state_norm_stats["max"], dtype=np.float32)
+            if low.shape != (8,) or high.shape != (8,):
+                raise ValueError(f"State min_max statistics must be length 8, got {low.shape}, {high.shape}")
+            normalized = np.array(values, copy=True)
+            mask = low != high
+            normalized[..., mask] = 2.0 * (values[..., mask] - low[mask]) / (high[mask] - low[mask]) - 1.0
+            normalized[..., ~mask] = 0.0
+            return np.clip(normalized, -1.0, 1.0)
+        if self.state_normalization == "mean_std":
+            mean = np.asarray(self.state_norm_stats["mean"], dtype=np.float32)
+            std = np.asarray(self.state_norm_stats["std"], dtype=np.float32)
+            if mean.shape != (8,) or std.shape != (8,):
+                raise ValueError(f"State mean_std statistics must be length 8, got {mean.shape}, {std.shape}")
+            normalized = np.array(values, copy=True)
+            mask = std != 0
+            normalized[..., mask] = (values[..., mask] - mean[mask]) / std[mask]
+            normalized[..., ~mask] = values[..., ~mask]
+            return normalized
+        raise ValueError(f"Unsupported state_normalization={self.state_normalization!r}")
 
     @staticmethod
     def unnormalize_actions(normalized_actions: np.ndarray, action_norm_stats: Dict[str, np.ndarray]) -> np.ndarray:

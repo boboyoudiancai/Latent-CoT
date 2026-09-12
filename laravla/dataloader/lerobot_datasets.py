@@ -2,6 +2,14 @@ from pathlib import Path
 from typing import Sequence
 from omegaconf import OmegaConf
 
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
 from laravla.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
 from laravla.dataloader.gr00t_lerobot.mixtures import DATASET_NAMED_MIXTURES
 from laravla.dataloader.gr00t_lerobot.data_config import ROBOT_TYPE_CONFIG_MAP
@@ -18,6 +26,8 @@ def make_LeRobotSingleDataset(
     bridge_annotation_cfg: dict | None = None,
     bridge_filter_cfg: dict | None = None,
     bridge_reasoning_cfg: dict | None = None,
+    include_state: bool = False,
+    state_normalization: str = "q99",
 ) -> LeRobotSingleDataset:
     """
     Make a LeRobotSingleDataset object.
@@ -31,7 +41,13 @@ def make_LeRobotSingleDataset(
     
     data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
     modality_config = data_config.modality_config()
-    transforms = data_config.transform()
+    if robot_type == "libero_franka":
+        transforms = data_config.transform(
+            include_state=include_state,
+            state_normalization=state_normalization,
+        )
+    else:
+        transforms = data_config.transform()
     dataset_path = data_root_dir / data_name
     if robot_type not in ROBOT_TYPE_TO_EMBODIMENT_TAG:
         print(f"Warning: Robot type {robot_type} not found in ROBOT_TYPE_TO_EMBODIMENT_TAG, using {EmbodimentTag.NEW_EMBODIMENT} as default")
@@ -53,6 +69,7 @@ def make_LeRobotSingleDataset(
     # during sample building (e.g. gripper open/close).
     ds.action_binary_thresholds = getattr(data_config, "action_binary_thresholds", {}) or {}
     ds.robot_type = robot_type
+    ds.include_state = include_state
     return ds
 
 def get_vla_dataset(
@@ -71,6 +88,8 @@ def get_vla_dataset(
     data_mix = data_cfg.data_mix
     bridge_annotations_cfg = getattr(data_cfg, "bridge_annotations", None)
     bridge_reasoning_cfg = getattr(data_cfg, "bridge_reasoning", None)
+    include_state = _as_bool(getattr(data_cfg, "include_state", False))
+    state_normalization = str(getattr(data_cfg, "state_normalization", "q99") or "q99").lower()
     if bridge_annotations_cfg is not None:
         bridge_annotations_cfg = OmegaConf.to_container(bridge_annotations_cfg, resolve=True)
         bridge_filters_cfg = None
@@ -102,6 +121,8 @@ def get_vla_dataset(
                 bridge_annotation_cfg=bridge_annotations_cfg,
                 bridge_filter_cfg=bridge_filters_cfg,
                 bridge_reasoning_cfg=bridge_reasoning_cfg,
+                include_state=include_state,
+                state_normalization=state_normalization,
             ),
             d_weight,
         ))

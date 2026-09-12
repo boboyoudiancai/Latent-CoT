@@ -62,6 +62,15 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         """
         super().__init__()
         self.config = config
+        raw_include_state = config.datasets.vla_data.get("include_state", False)
+        include_state = (
+            raw_include_state.strip().lower() in {"1", "true", "yes", "on"}
+            if isinstance(raw_include_state, str)
+            else bool(raw_include_state)
+        )
+        if include_state:
+            # Native LIBERO state is xyz + axis-angle + two gripper qpos values.
+            self.config.framework.action_model.state_dim = 8
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
