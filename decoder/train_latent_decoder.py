@@ -138,7 +138,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--img_next_teacher_type",
         default="qwen",
-        choices=["qwen", "vjepa2_1_vit_large_384"],
+        choices=[
+            "qwen",
+            "vjepa2_1_vit_base_384",
+            "vjepa2_1_vit_large_384",
+            "vjepa2_1_vit_giant_384",
+            "vjepa2_1_vit_gigantic_384",
+        ],
         help="Visual encoder used to produce ImageNext supervision targets.",
     )
     parser.add_argument(
@@ -150,7 +156,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--img_next_teacher_repo",
         default=None,
-        help="Local Hugging Face model directory for V-JEPA 2.1 ViT-L/16 384.",
+        help="Local Hugging Face model directory for V-JEPA 2.1.",
     )
     parser.add_argument("--img_next_teacher_input_size", type=int, default=384)
     parser.add_argument(
@@ -172,7 +178,7 @@ def main() -> None:
             raise ValueError("--img_next_loss_weight must be positive when ImageNext is enabled")
         if args.img_next_res <= 0:
             raise ValueError("--img_next_res must be positive when ImageNext is enabled")
-        if args.img_next_teacher_type == "vjepa2_1_vit_large_384":
+        if args.img_next_teacher_type.startswith("vjepa2_1_vit_"):
             if args.img_next_target_frame != "current":
                 raise ValueError("V-JEPA 2.1 teacher requires --img_next_target_frame current")
             if args.img_next_teacher_update_mode != "frozen":

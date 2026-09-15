@@ -115,10 +115,16 @@ class _QWen3_VL_Interface(nn.Module):
         self.use_img_next_teacher = bool(img_next_cfg.get("use_teacher", True)) if enable_img_next else False
         self.img_next_teacher_type = str(img_next_cfg.get("teacher_type", "qwen")).strip().lower()
         self.img_next_target_frame = str(img_next_cfg.get("target_frame", "next")).strip().lower()
-        if self.img_next_teacher_type not in {"qwen", "vjepa2_1_vit_large_384"}:
+        if self.img_next_teacher_type not in {
+            "qwen",
+            "vjepa2_1_vit_base_384",
+            "vjepa2_1_vit_large_384",
+            "vjepa2_1_vit_giant_384",
+            "vjepa2_1_vit_gigantic_384",
+        }:
             raise ValueError(
-                "framework.img_next.teacher_type must be 'qwen' or "
-                f"'vjepa2_1_vit_large_384', got {self.img_next_teacher_type!r}"
+                "framework.img_next.teacher_type must be 'qwen' or a supported "
+                f"V-JEPA 2.1 type, got {self.img_next_teacher_type!r}"
             )
         if self.img_next_target_frame not in {"current", "next"}:
             raise ValueError(
@@ -159,7 +165,7 @@ class _QWen3_VL_Interface(nn.Module):
         return result
 
     def _init_img_next_vjepa_teacher(self, img_next_cfg) -> None:
-        from .jepa_teacher import VJEPA21ViTLargeTeacher
+        from .jepa_teacher import VJEPA21Teacher
 
         if self.img_next_target_frame != "current":
             raise ValueError("V-JEPA 2.1 ImageNext supervision requires target_frame='current'")
@@ -172,9 +178,10 @@ class _QWen3_VL_Interface(nn.Module):
                 "V-JEPA 2.1 teacher requires framework.img_next.teacher_repo"
             )
         teacher_input_size = int(img_next_cfg.get("teacher_input_size", 384))
-        self.img_next_external_teacher = VJEPA21ViTLargeTeacher(
+        self.img_next_external_teacher = VJEPA21Teacher(
             teacher_repo=teacher_repo,
             input_size=teacher_input_size,
+            teacher_type=self.img_next_teacher_type,
         )
         hidden_size = int(self.model.config.text_config.hidden_size)
         self.img_next_target_projection = nn.Linear(
@@ -183,7 +190,8 @@ class _QWen3_VL_Interface(nn.Module):
             bias=False,
         )
         logger.info(
-            "[img_next_teacher] Initialized frozen V-JEPA 2.1 ViT-L teacher "
+            "[img_next_teacher] Initialized frozen V-JEPA 2.1 teacher "
+            f"type={self.img_next_teacher_type} "
             f"(target_frame=current, input_size={teacher_input_size}, "
             f"student_dim={hidden_size}, target_dim={self.img_next_external_teacher.embed_dim})"
         )

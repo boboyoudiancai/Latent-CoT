@@ -45,8 +45,16 @@ def build_image_transform(input_size: int):
     )
 
 
-class VJEPA21ViTLargeTeacher:
-    """Frozen V-JEPA 2.1 ViT-L/16 teacher loaded from the official repository.
+SUPPORTED_VJEPA21_TEACHERS = {
+    "vjepa2_1_vit_base_384",
+    "vjepa2_1_vit_large_384",
+    "vjepa2_1_vit_giant_384",
+    "vjepa2_1_vit_gigantic_384",
+}
+
+
+class VJEPA21Teacher:
+    """Frozen V-JEPA 2.1 teacher loaded from a local HF repository.
 
     This wrapper is intentionally not an ``nn.Module``. The external 300M
     teacher is therefore absent from LaRA checkpoints and optimizer groups.
@@ -61,7 +69,15 @@ class VJEPA21ViTLargeTeacher:
         self,
         teacher_repo: str,
         input_size: int = 384,
+        teacher_type: str = "vjepa2_1_vit_large_384",
     ) -> None:
+        teacher_type = str(teacher_type).strip().lower()
+        if teacher_type not in SUPPORTED_VJEPA21_TEACHERS:
+            raise ValueError(
+                f"unsupported V-JEPA 2.1 teacher type: {teacher_type!r}; "
+                f"expected one of {sorted(SUPPORTED_VJEPA21_TEACHERS)}"
+            )
+        self.model_name = teacher_type
         repo = Path(teacher_repo).expanduser().resolve()
         if not (repo / "config.json").is_file():
             raise FileNotFoundError(

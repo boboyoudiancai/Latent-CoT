@@ -22,6 +22,11 @@ from laravla.training.trainer_utils import initialize_overwatch
 
 logger = initialize_overwatch(__name__)
 
+
+def _is_vjepa21_teacher(teacher_type: str) -> bool:
+    return str(teacher_type).strip().lower().startswith("vjepa2_1_vit_")
+
+
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
@@ -233,7 +238,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     teacher_type=img_next_teacher_type,
                 )
             except Exception as e:
-                if img_next_teacher_type == "vjepa2_1_vit_large_384":
+                if _is_vjepa21_teacher(img_next_teacher_type):
                     raise RuntimeError("V-JEPA 2.1 target generation failed") from e
                 logger.warning(f"[img_next_loss] skipped due to error: {e}")
                 img_next_loss = None
@@ -401,7 +406,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 logger.warning("[img_next_loss] no images to process")
                 return None
 
-            if teacher_type == "vjepa2_1_vit_large_384":
+            if _is_vjepa21_teacher(teacher_type):
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     target_feats = self.qwen_vl_interface.get_external_img_next_target(
                         images=flat_images,
@@ -426,7 +431,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 flat_images = resized
             
            
-            if teacher_type != "vjepa2_1_vit_large_384":
+            if not _is_vjepa21_teacher(teacher_type):
                 proc = getattr(self.qwen_vl_interface, "processor", None)
                 if proc is None and hasattr(self.qwen_vl_interface, "model"):
                     proc = getattr(self.qwen_vl_interface.model, "processor", None)
@@ -491,7 +496,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     feats_2d = F.adaptive_avg_pool2d(feats_2d, output_size=(target_side, target_side))
                     target_feats = feats_2d.flatten(2).transpose(1, 2)  # [B, target_tokens, C]
         except Exception as e:
-            if teacher_type == "vjepa2_1_vit_large_384":
+            if _is_vjepa21_teacher(teacher_type):
                 raise
             logger.warning(f"[img_next_loss] visual encoding failed: {e}")
             return None
