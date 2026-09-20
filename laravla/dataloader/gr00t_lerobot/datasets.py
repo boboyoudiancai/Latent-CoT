@@ -307,6 +307,10 @@ class LeRobotSingleDataset(Dataset):
             include_bbox = bool(reasoning_cfg.get("include_bbox", True)) if isinstance(reasoning_cfg, dict) else True
             include_actions = bool(reasoning_cfg.get("include_action_tokens", True)) if isinstance(reasoning_cfg, dict) else True
             include_img_next = bool(reasoning_cfg.get("include_img_next", True)) if isinstance(reasoning_cfg, dict) else True
+            include_spatial = bool(reasoning_cfg.get("include_spatial", False)) if isinstance(reasoning_cfg, dict) else False
+            spatial_base_token = reasoning_cfg.get("spatial_base_token", "<spatial_base>") if isinstance(reasoning_cfg, dict) else "<spatial_base>"
+            spatial_wrist_token = reasoning_cfg.get("spatial_wrist_token", "<spatial_wrist>") if isinstance(reasoning_cfg, dict) else "<spatial_wrist>"
+            spatial_count = int(reasoning_cfg.get("spatial_count", 16)) if isinstance(reasoning_cfg, dict) else 16
             thinking_token = reasoning_cfg.get("thinking_token", "<|thinking|>") if isinstance(reasoning_cfg, dict) else "<|thinking|>"
             start_token = reasoning_cfg.get("start_token", "<|start_of_thinking|>") if isinstance(reasoning_cfg, dict) else "<|start_of_thinking|>"
             end_token = reasoning_cfg.get("end_token", "<|end_of_thinking|>") if isinstance(reasoning_cfg, dict) else "<|end_of_thinking|>"
@@ -337,6 +341,10 @@ class LeRobotSingleDataset(Dataset):
                 include_bbox=include_bbox,
                 include_action_tokens=include_actions,
                 include_img_next=include_img_next,
+                include_spatial=include_spatial,
+                spatial_base_token=spatial_base_token,
+                spatial_wrist_token=spatial_wrist_token,
+                spatial_count=spatial_count,
                 thinking_token=thinking_token,
                 start_token=start_token,
                 end_token=end_token,

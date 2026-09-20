@@ -41,6 +41,10 @@ datasets:
       stage: 4          # Stage 2: subtask latent, reasoning/bbox still explicit
       include_bbox: true
       include_action_tokens: true
+      include_spatial: false
+      spatial_base_token: "<spatial_base>"
+      spatial_wrist_token: "<spatial_wrist>"
+      spatial_count: 16
       thinking_token: "<|thinking|>"
       start_token: "<|start_of_thinking|>"
       end_token: "<|end_of_thinking|>"
@@ -73,6 +77,22 @@ framework:
     loss_weight: 0.1
     res: 112  # 112x112 输入，经 2x2 merge 得 16 token
     use_teacher: false
+  # Spatial-Forcing style VGGT alignment. Disabled by default.
+  spatial:
+    enable: false
+    use_teacher: false
+    loss_weight: 0.1
+    teacher_repo: null
+    input_size: 518
+    preprocess_mode: "resize"
+    teacher_layer: -1
+    patch_start_idx: 5
+    token_count: 16
+    target_dim: 2048
+    base_token: "<spatial_base>"
+    wrist_token: "<spatial_wrist>"
+    use_vlm_norm: true
+    use_vggt_pe: true
   qwenvl:
     base_vlm: "StarVLA/Qwen3-VL-4B-Instruct-Action"
     attn_implementation: "sdpa"

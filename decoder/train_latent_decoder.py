@@ -166,6 +166,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Number of ImageNext tokens. Current implementation requires 16.",
     )
     parser.add_argument("--img_next_res", type=int, default=112)
+    parser.add_argument("--enable_spatial_tokens", action="store_true")
+    parser.add_argument("--spatial_loss_weight", type=float, default=0.1)
+    parser.add_argument("--spatial_use_teacher", action="store_true")
+    parser.add_argument("--spatial_teacher_repo", default=None)
+    parser.add_argument("--spatial_input_size", type=int, default=518)
+    parser.add_argument("--spatial_preprocess_mode", default="resize", choices=["resize", "crop", "pad"])
+    parser.add_argument("--spatial_count", type=int, default=16)
+    parser.add_argument("--spatial_base_token", default="<spatial_base>")
+    parser.add_argument("--spatial_wrist_token", default="<spatial_wrist>")
+    parser.add_argument("--spatial_teacher_layer", type=int, default=-1)
+    parser.add_argument("--spatial_patch_start_idx", type=int, default=5)
+    parser.add_argument("--spatial_target_dim", type=int, default=2048)
+    parser.add_argument("--spatial_projector_hidden_dim", type=int, default=2048)
+    parser.add_argument("--spatial_use_vlm_norm", action="store_true", default=True)
+    parser.add_argument("--spatial_use_vggt_pe", action="store_true", default=True)
     return parser.parse_args(argv)
 
 
@@ -187,6 +202,15 @@ def main() -> None:
                 raise ValueError("V-JEPA 2.1 teacher requires --img_next_teacher_repo")
             if args.img_next_teacher_input_size <= 0:
                 raise ValueError("--img_next_teacher_input_size must be positive")
+    if args.enable_spatial_tokens:
+        if not args.spatial_use_teacher:
+            raise ValueError("--enable_spatial_tokens requires --spatial_use_teacher")
+        if not args.spatial_teacher_repo:
+            raise ValueError("--enable_spatial_tokens requires --spatial_teacher_repo")
+        if args.spatial_count != 16:
+            raise ValueError("spatial_count must be 16 for the current attention block")
+        if args.spatial_loss_weight <= 0:
+            raise ValueError("spatial_loss_weight must be positive when spatial tokens are enabled")
     gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps))
     args.gradient_accumulation_steps = gradient_accumulation_steps
     if args.decoder_loss_weight_final is None and args.decoder_loss_weight_schedule != "constant":
@@ -237,6 +261,11 @@ def main() -> None:
         dtype=dtype,
         freeze_vlm=args.freeze_vlm,
     )
+    # The VGGT adapter discovers the actual teacher feature width at construction.
+    # Persist that resolved width so a Stage-2 action-only reload builds the same projector.
+    if accelerator.is_main_process:
+        OmegaConf.save(cfg, output_dir / "config.yaml")
+        OmegaConf.save(cfg, output_dir / "vlm_config_used.yaml")
     qwen_iface = vlm_model.qwen_vl_interface
     tokenizer = qwen_iface.processor.tokenizer
     qwen_model = qwen_iface.model
@@ -511,6 +540,13 @@ class SimCoTTrainingModule(nn.Module):
         if img_next_loss is not None:
             result["img_next_loss"] = img_next_loss
             result["img_next_loss_weight"] = decoder_loss.detach().new_tensor(img_next_weight)
+        spatial_loss = outputs.get("spatial_loss")
+        if spatial_loss is not None:
+            spatial_weight = float(self.cfg.framework.spatial.loss_weight)
+            total_loss = total_loss + spatial_weight * spatial_loss
+            result["total_loss"] = total_loss
+            result["spatial_loss"] = spatial_loss
+            result["spatial_loss_weight"] = decoder_loss.detach().new_tensor(spatial_weight)
         if action_token_loss is not None:
             result["action_token_loss"] = action_token_loss
         return result
@@ -585,6 +621,23 @@ class SimCoTTrainingModule(nn.Module):
                 teacher_type=teacher_type,
             )
 
+        spatial_cfg = getattr(self.cfg.framework, "spatial", {})
+        if (
+            bool(spatial_cfg.get("enable", False))
+            and bool(spatial_cfg.get("use_teacher", True))
+            and float(spatial_cfg.get("loss_weight", 0.0) or 0.0) > 0
+        ):
+            base_id = getattr(qwen_iface, "spatial_base_token_id", None)
+            wrist_id = getattr(qwen_iface, "spatial_wrist_token_id", None)
+            if base_id is None or wrist_id is None:
+                raise RuntimeError("spatial tokens are enabled in config but missing from Qwen tokenizer")
+            outputs["spatial_loss"] = self.vlm_model._compute_spatial_loss(
+                last_hidden=outputs["hidden_states"],
+                target_images=batch_images,
+                base_mask=qwen_inputs["input_ids"] == int(base_id),
+                wrist_mask=qwen_inputs["input_ids"] == int(wrist_id),
+            )
+
         bridge_cfg = self.cfg.datasets.vla_data.bridge_reasoning
         component_order = normalize_component_order(getattr(bridge_cfg, "component_order", None))
         decoder_batch = build_latent_decoder_batch(
@@ -648,6 +701,20 @@ def apply_stage4_base_init_contract(cfg, args: argparse.Namespace):
         "framework.img_next.teacher_repo": args.img_next_teacher_repo,
         "framework.img_next.teacher_input_size": int(args.img_next_teacher_input_size),
         "framework.img_next.res": int(args.img_next_res),
+        "framework.spatial.enable": bool(args.enable_spatial_tokens),
+        "framework.spatial.use_teacher": bool(args.spatial_use_teacher) if args.enable_spatial_tokens else False,
+        "framework.spatial.loss_weight": float(args.spatial_loss_weight) if args.enable_spatial_tokens else 0.0,
+        "framework.spatial.teacher_repo": args.spatial_teacher_repo,
+        "framework.spatial.input_size": int(args.spatial_input_size),
+        "framework.spatial.token_count": int(args.spatial_count),
+        "framework.spatial.base_token": str(args.spatial_base_token),
+        "framework.spatial.wrist_token": str(args.spatial_wrist_token),
+        "framework.spatial.teacher_layer": int(args.spatial_teacher_layer),
+        "framework.spatial.patch_start_idx": int(args.spatial_patch_start_idx),
+        "framework.spatial.target_dim": int(args.spatial_target_dim),
+        "framework.spatial.projector_hidden_dim": int(args.spatial_projector_hidden_dim),
+        "framework.spatial.use_vlm_norm": bool(args.spatial_use_vlm_norm),
+        "framework.spatial.use_vggt_pe": bool(args.spatial_use_vggt_pe),
         "framework.cot_mode_flags.enable_latent_reasoning": True,
         "framework.cot_mode_flags.emit_explicit_cot": False,
         "framework.cot_mode_flags.use_iterative_forward": True,
@@ -659,6 +726,10 @@ def apply_stage4_base_init_contract(cfg, args: argparse.Namespace):
         "datasets.vla_data.bridge_reasoning.include_action_tokens": False,
         "datasets.vla_data.bridge_reasoning.include_img_next": bool(args.enable_img_next),
         "datasets.vla_data.bridge_reasoning.img_next_count": int(args.img_next_count),
+        "datasets.vla_data.bridge_reasoning.include_spatial": bool(args.enable_spatial_tokens),
+        "datasets.vla_data.bridge_reasoning.spatial_count": int(args.spatial_count),
+        "datasets.vla_data.bridge_reasoning.spatial_base_token": str(args.spatial_base_token),
+        "datasets.vla_data.bridge_reasoning.spatial_wrist_token": str(args.spatial_wrist_token),
         "datasets.vla_data.bridge_reasoning.component_order": component_order,
     }
     for key, value in updates.items():
@@ -808,8 +879,31 @@ def apply_runtime_overrides(cfg, args: argparse.Namespace):
     cfg.framework.img_next.teacher_repo = args.img_next_teacher_repo
     cfg.framework.img_next.teacher_input_size = int(args.img_next_teacher_input_size)
     cfg.framework.img_next.res = int(args.img_next_res)
+    spatial_updates = {
+        "framework.spatial.enable": bool(args.enable_spatial_tokens),
+        "framework.spatial.use_teacher": bool(args.spatial_use_teacher) if args.enable_spatial_tokens else False,
+        "framework.spatial.loss_weight": float(args.spatial_loss_weight) if args.enable_spatial_tokens else 0.0,
+        "framework.spatial.teacher_repo": args.spatial_teacher_repo,
+        "framework.spatial.input_size": int(args.spatial_input_size),
+        "framework.spatial.preprocess_mode": str(args.spatial_preprocess_mode),
+        "framework.spatial.token_count": int(args.spatial_count),
+        "framework.spatial.base_token": str(args.spatial_base_token),
+        "framework.spatial.wrist_token": str(args.spatial_wrist_token),
+        "framework.spatial.teacher_layer": int(args.spatial_teacher_layer),
+        "framework.spatial.patch_start_idx": int(args.spatial_patch_start_idx),
+        "framework.spatial.target_dim": int(args.spatial_target_dim),
+        "framework.spatial.projector_hidden_dim": int(args.spatial_projector_hidden_dim),
+        "framework.spatial.use_vlm_norm": bool(args.spatial_use_vlm_norm),
+        "framework.spatial.use_vggt_pe": bool(args.spatial_use_vggt_pe),
+    }
+    for key, value in spatial_updates.items():
+        OmegaConf.update(cfg, key, value, merge=False, force_add=True)
     cfg.datasets.vla_data.bridge_reasoning.include_img_next = bool(args.enable_img_next)
     cfg.datasets.vla_data.bridge_reasoning.img_next_count = int(args.img_next_count)
+    cfg.datasets.vla_data.bridge_reasoning.include_spatial = bool(args.enable_spatial_tokens)
+    cfg.datasets.vla_data.bridge_reasoning.spatial_count = int(args.spatial_count)
+    cfg.datasets.vla_data.bridge_reasoning.spatial_base_token = str(args.spatial_base_token)
+    cfg.datasets.vla_data.bridge_reasoning.spatial_wrist_token = str(args.spatial_wrist_token)
     if args.enable_img_next and int(args.img_next_count) != 16:
         raise ValueError("Current ImageNext attention/loss implementation requires img_next_count=16")
     return cfg

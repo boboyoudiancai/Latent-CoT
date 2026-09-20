@@ -102,7 +102,19 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 param.requires_grad = False
         else:
             print(f"[Training Stage] full mode - All parameters trainable")
-        
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Load checkpoints while allowing Stage 2 to omit the spatial projector."""
+        spatial_cfg = getattr(self.config.framework, "spatial", {}) if hasattr(self.config, "framework") else {}
+        spatial_enabled = bool(spatial_cfg.get("enable", False))
+        spatial_teacher = bool(spatial_cfg.get("use_teacher", True)) if spatial_enabled else False
+        if spatial_enabled and not spatial_teacher:
+            state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if "spatial_align_projector." not in key
+            }
+        return super().load_state_dict(state_dict, strict=strict)
 
     def forward(
         self,
@@ -243,6 +255,28 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 logger.warning(f"[img_next_loss] skipped due to error: {e}")
                 img_next_loss = None
         
+        spatial_cfg = getattr(self.config.framework, "spatial", {}) if hasattr(self.config, "framework") else {}
+        enable_spatial = bool(spatial_cfg.get("enable", False))
+        spatial_loss_weight = float(spatial_cfg.get("loss_weight", 0.0) or 0.0)
+        spatial_base_id = getattr(self.qwen_vl_interface, "spatial_base_token_id", None)
+        spatial_wrist_id = getattr(self.qwen_vl_interface, "spatial_wrist_token_id", None)
+        spatial_loss = None
+        if (
+            enable_spatial
+            and bool(spatial_cfg.get("use_teacher", True))
+            and spatial_loss_weight > 0
+            and spatial_base_id is not None
+            and spatial_wrist_id is not None
+        ):
+            base_mask = qwen_inputs["input_ids"] == int(spatial_base_id)
+            wrist_mask = qwen_inputs["input_ids"] == int(spatial_wrist_id)
+            spatial_loss = self._compute_spatial_loss(
+                last_hidden=last_hidden,
+                target_images=batch_images,
+                base_mask=base_mask,
+                wrist_mask=wrist_mask,
+            )
+
         if self.training_stage == "reasoning_only":
             # Stage 1: Only train VLM reasoning, skip action head
             if vlm_loss is None:
@@ -256,6 +290,9 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 result["total_loss"] = vlm_loss + img_next_loss_weight * img_next_loss
             else:
                 result["total_loss"] = vlm_loss
+            if spatial_loss is not None:
+                result["spatial_loss"] = spatial_loss
+                result["total_loss"] = result["total_loss"] + spatial_loss_weight * spatial_loss
             return result
 
         elif self.training_stage == "action_only":
@@ -357,8 +394,46 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         ):
             result["img_next_loss"] = img_next_loss
             result["total_loss"] = result["total_loss"] + img_next_loss_weight * img_next_loss
+        if spatial_loss is not None:
+            result["spatial_loss"] = spatial_loss
+            result["total_loss"] = result["total_loss"] + spatial_loss_weight * spatial_loss
 
         return result
+
+    def _compute_spatial_loss(
+        self,
+        last_hidden: torch.Tensor,
+        target_images: List,
+        base_mask: torch.Tensor,
+        wrist_mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Align base/wrist special-token hidden states to pooled VGGT features."""
+        if last_hidden is None or not torch.any(base_mask) or not torch.any(wrist_mask):
+            return None
+        batch_size = last_hidden.shape[0]
+        base_count = int(base_mask.sum(dim=1).max().item())
+        wrist_count = int(wrist_mask.sum(dim=1).max().item())
+        if base_count != wrist_count or base_count != int(
+            getattr(self.qwen_vl_interface, "spatial_target_tokens", 16)
+        ):
+            raise ValueError(
+                f"spatial token count mismatch: base={base_count}, wrist={wrist_count}, "
+                f"expected={getattr(self.qwen_vl_interface, 'spatial_target_tokens', 16)}"
+            )
+        pred_base = last_hidden[base_mask].view(batch_size, base_count, -1)
+        pred_wrist = last_hidden[wrist_mask].view(batch_size, wrist_count, -1)
+        pred = torch.stack([pred_base, pred_wrist], dim=1)
+        target = self.qwen_vl_interface.get_external_spatial_target(
+            images=target_images,
+            device=last_hidden.device,
+        )
+        pred = self.qwen_vl_interface.project_spatial_prediction(pred)
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"VGGT spatial shape mismatch: prediction={tuple(pred.shape)} target={tuple(target.shape)}"
+            )
+        cosine = F.cosine_similarity(pred.float(), target.float(), dim=-1)
+        return (1.0 - cosine).mean()
 
     def _compute_img_next_loss(
         self,

@@ -11,6 +11,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 
 from laravla.training.trainer_utils import initialize_overwatch
+from .vggt_teacher import AlignProjector, VGGTTeacher
 
 logger = initialize_overwatch(__name__)
 BASE_PROMPT = (
@@ -110,6 +111,21 @@ class _QWen3_VL_Interface(nn.Module):
         else:
             self.img_next_token_id = None
 
+        spatial_cfg = getattr(config.framework, "spatial", {}) if hasattr(config, "framework") else {}
+        self.enable_spatial = bool(spatial_cfg.get("enable", False))
+        self.spatial_base_token_id = None
+        self.spatial_wrist_token_id = None
+        self.spatial_target_tokens = int(spatial_cfg.get("token_count", 16))
+        self.spatial_external_teacher = None
+        self.spatial_align_projector: Optional[nn.Module] = None
+        self.spatial_target_dim = int(spatial_cfg.get("target_dim", 2048))
+        self.spatial_use_teacher = bool(spatial_cfg.get("use_teacher", True)) if self.enable_spatial else False
+        if self.enable_spatial:
+            token_ids = self._add_spatial_tokens(self.processor.tokenizer, config)
+            self.spatial_base_token_id = token_ids["base"]
+            self.spatial_wrist_token_id = token_ids["wrist"]
+            self._init_spatial_vggt_teacher(spatial_cfg)
+
         # ImageNext target vision encoder (Qwen EMA by default for compatibility).
         self.enable_img_next = bool(enable_img_next)
         self.use_img_next_teacher = bool(img_next_cfg.get("use_teacher", True)) if enable_img_next else False
@@ -162,7 +178,101 @@ class _QWen3_VL_Interface(nn.Module):
         external_teacher = getattr(self, "img_next_external_teacher", None)
         if external_teacher is not None:
             external_teacher.encoder.eval()
+        spatial_teacher = getattr(self, "spatial_external_teacher", None)
+        if spatial_teacher is not None:
+            spatial_teacher.encoder.eval()
         return result
+
+    def _add_spatial_tokens(self, tokenizer, cfg):
+        spatial_cfg = cfg.framework.get("spatial", {})
+        base_token = spatial_cfg.get("base_token", "<spatial_base>")
+        wrist_token = spatial_cfg.get("wrist_token", "<spatial_wrist>")
+        existing = set(tokenizer.get_vocab().keys())
+        tokens_to_add = [tok for tok in (base_token, wrist_token) if tok not in existing]
+        if tokens_to_add:
+            tokenizer.add_tokens(tokens_to_add, special_tokens=True)
+        embeddings = self.model.get_input_embeddings()
+        if len(tokenizer) > embeddings.weight.shape[0]:
+            self.model.resize_token_embeddings(len(tokenizer))
+            embeddings = self.model.get_input_embeddings()
+        target_token = "<<"
+        if target_token not in tokenizer.get_vocab():
+            target_token = tokenizer.pad_token if tokenizer.pad_token else tokenizer.bos_token
+        target_id = tokenizer.convert_tokens_to_ids(target_token)
+        if target_id == tokenizer.unk_token_id:
+            target_id = 0
+            while target_id < len(tokenizer):
+                tok = tokenizer.convert_ids_to_tokens(target_id)
+                if not (tok.startswith("<") and tok.endswith(">")):
+                    break
+                target_id += 1
+        target_embedding = embeddings.weight.data[target_id].clone()
+        ids = {
+            "base": tokenizer.convert_tokens_to_ids(base_token),
+            "wrist": tokenizer.convert_tokens_to_ids(wrist_token),
+        }
+        for token_id in ids.values():
+            if token_id == tokenizer.unk_token_id:
+                raise ValueError("failed to add spatial token")
+            embeddings.weight.data[token_id] = target_embedding
+        if hasattr(self.model, "lm_head") and self.model.lm_head is not None:
+            if not (hasattr(self.model, "tie_word_embeddings") and self.model.tie_word_embeddings):
+                lm_head = self.model.lm_head
+                if hasattr(lm_head, "weight"):
+                    target_lm_weight = lm_head.weight.data[target_id].clone()
+                    for token_id in ids.values():
+                        lm_head.weight.data[token_id] = target_lm_weight
+        logger.info(
+            "[spatial_tokens] initialized base/wrist token embeddings from ordinary token %r",
+            target_token,
+        )
+        return ids
+
+    def _init_spatial_vggt_teacher(self, spatial_cfg) -> None:
+        target_dim = int(spatial_cfg.get("target_dim", self.spatial_target_dim))
+        if self.spatial_use_teacher:
+            repo = str(spatial_cfg.get("teacher_repo", "") or "").strip()
+            self.spatial_external_teacher = VGGTTeacher(
+                teacher_repo=repo,
+                input_size=int(spatial_cfg.get("input_size", 518)),
+                layer=int(spatial_cfg.get("teacher_layer", -1)),
+                patch_start_idx=int(spatial_cfg.get("patch_start_idx", 5)),
+                use_vggt_pe=bool(spatial_cfg.get("use_vggt_pe", True)),
+                preprocess_mode=str(spatial_cfg.get("preprocess_mode", "resize")),
+            )
+            target_dim = int(self.spatial_external_teacher.embed_dim)
+        if not self.spatial_use_teacher:
+            logger.info(
+                "[spatial_teacher] Stage-2 token-only mode: keeping base/wrist tokens without VGGT projector"
+            )
+            return
+        hidden_size = int(self.model.config.text_config.hidden_size)
+        self.spatial_target_dim = target_dim
+        try:
+            spatial_cfg.target_dim = target_dim
+        except Exception:
+            pass
+        self.spatial_align_projector = AlignProjector(
+            input_dim=hidden_size,
+            output_dim=target_dim,
+            use_vlm_norm=bool(spatial_cfg.get("use_vlm_norm", True)),
+        )
+        logger.info(
+            "[spatial_teacher] projector initialized student_dim=%d target_dim=%d views=base,wrist tokens/view=%d",
+            hidden_size,
+            target_dim,
+            self.spatial_target_tokens,
+        )
+
+    def project_spatial_prediction(self, prediction: torch.Tensor) -> torch.Tensor:
+        projector = getattr(self, "spatial_align_projector", None)
+        return projector(prediction) if projector is not None else prediction
+
+    def get_external_spatial_target(self, images, device: torch.device) -> torch.Tensor:
+        teacher = getattr(self, "spatial_external_teacher", None)
+        if teacher is None:
+            raise RuntimeError("external VGGT spatial teacher is not initialized")
+        return teacher.encode(images=images, device=device, target_tokens=self.spatial_target_tokens)
 
     def _init_img_next_vjepa_teacher(self, img_next_cfg) -> None:
         from .jepa_teacher import VJEPA21Teacher
@@ -467,56 +577,45 @@ class _QWen3_VL_Interface(nn.Module):
 
     def _build_img_next_full_attention_mask(
         self,
-        attention_mask: torch.Tensor,  # [B, T] pad mask (1=valid)
-        input_ids: torch.Tensor,       # [B, T]
+        attention_mask: torch.Tensor,
+        input_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Build a full 4D additive mask [B, 1, T, T] that is:
-          - causal + padding for the whole sequence
-          - plus bidirectional attention inside the *last contiguous 16* <img_next> tokens
-
-        NOTE: This assumes <img_next> has no tokens after it (end of sequence segment).
-        """
+        """Causal mask plus independent bidirectional ImageNext/spatial blocks."""
         if attention_mask.ndim != 2 or input_ids.ndim != 2:
-            raise ValueError(
-                f"Expected attention_mask/input_ids to be 2D [B,T], got {attention_mask.ndim}D/{input_ids.ndim}D"
-            )
+            raise ValueError("attention_mask and input_ids must be [B,T]")
         if attention_mask.shape != input_ids.shape:
-            raise ValueError(f"attention_mask shape {tuple(attention_mask.shape)} != input_ids shape {tuple(input_ids.shape)}")
-
-        B, T = attention_mask.shape
+            raise ValueError("attention_mask and input_ids shape mismatch")
+        batch_size, seq_len = attention_mask.shape
         device = attention_mask.device
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         min_val = torch.finfo(dtype).min
-
         valid = attention_mask.to(torch.bool)
+        idx = torch.arange(seq_len, device=device)
+        allow = torch.tril(torch.ones((seq_len, seq_len), device=device, dtype=torch.bool))
+        allow = allow.unsqueeze(0) & valid.unsqueeze(2) & valid.unsqueeze(1)
 
-        # Base causal + padding mask (bool allow matrix)
-        base = torch.tril(torch.ones((T, T), device=device, dtype=torch.bool))
-        allow = base.unsqueeze(0) & valid.unsqueeze(2) & valid.unsqueeze(1)  # [B, T, T]
+        token_ids = (
+            getattr(self, "img_next_token_id", None),
+            getattr(self, "spatial_base_token_id", None),
+            getattr(self, "spatial_wrist_token_id", None),
+        )
+        for token_id in token_ids:
+            if token_id is None:
+                continue
+            token_mask = (input_ids == int(token_id)) & valid
+            has_token = token_mask.any(dim=1)
+            positions = token_mask.to(torch.long) * idx
+            end = positions.max(dim=1).values
+            count = token_mask.sum(dim=1)
+            start = end - count + 1
+            block = torch.zeros_like(token_mask)
+            for row in range(batch_size):
+                if bool(has_token[row]) and int(count[row]) == 16 and int(start[row]) >= 0:
+                    block[row, int(start[row]): int(end[row]) + 1] = True
+            if block.any():
+                allow = allow | (block.unsqueeze(2) & block.unsqueeze(1))
 
-        img_next_id = getattr(self, "img_next_token_id", None)
-        if img_next_id is not None:
-            img = (input_ids == img_next_id) & valid  # [B, T]
-            has_img = img.any(dim=1)  # [B]
-
-            idx = torch.arange(T, device=device)
-            end = (img.to(torch.long) * idx).max(dim=1).values  # [B]
-            block_len = 16
-            start = end - (block_len - 1)  # [B]
-
-            block = (idx.unsqueeze(0) >= start.unsqueeze(1)) & (idx.unsqueeze(0) <= end.unsqueeze(1))  # [B, T]
-            block_ok = (
-                has_img
-                & (start >= 0)
-                & (block.sum(dim=1) == block_len)
-                & ((img & block).sum(dim=1) == block_len)
-            )
-            if block_ok.any():
-                block = block & block_ok.unsqueeze(1)
-                allow = allow | (block.unsqueeze(2) & block.unsqueeze(1))  # bidirectional inside block
-
-        full = torch.full((B, 1, T, T), min_val, device=device, dtype=dtype)
+        full = torch.full((batch_size, 1, seq_len, seq_len), min_val, device=device, dtype=dtype)
         full.masked_fill_(allow.unsqueeze(1), 0)
         return full
 
@@ -845,6 +944,12 @@ class _QWen3_VL_Interface(nn.Module):
 
     def load_state_dict(self, state_dict, strict: bool = True):
 
+        if getattr(self, "enable_spatial", False) and not getattr(self, "spatial_use_teacher", False):
+            state_dict = {
+                k: v for k, v in state_dict.items()
+                if "spatial_align_projector." not in k
+            }
+
         if not getattr(self, "use_img_next_teacher", True):
             pruned = {
                 k: v
@@ -947,9 +1052,14 @@ class _QWen3_VL_Interface(nn.Module):
                     seq[:prompt_len] = IGNORE_INDEX
             
             labels[labels == self.processor.tokenizer.pad_token_id] = -100 ## mask out pad tokens as well
-            # Mask img_next tokens out of VLM loss
-            if getattr(self, "img_next_token_id", None) is not None:
-                labels[labels == self.img_next_token_id] = IGNORE_INDEX
+            # Mask auxiliary special-token carriers out of VLM loss.
+            for token_id in (
+                getattr(self, "img_next_token_id", None),
+                getattr(self, "spatial_base_token_id", None),
+                getattr(self, "spatial_wrist_token_id", None),
+            ):
+                if token_id is not None:
+                    labels[labels == token_id] = IGNORE_INDEX
             batch_inputs['labels'] = labels
 
         return batch_inputs.to(self.model.device)
@@ -1055,6 +1165,13 @@ class _QWen3_VL_Interface(nn.Module):
                 think_id=thinking_token_id,
                 end_id=end_id,
             )
+            for token_id in (
+                getattr(self, "img_next_token_id", None),
+                getattr(self, "spatial_base_token_id", None),
+                getattr(self, "spatial_wrist_token_id", None),
+            ):
+                if token_id is not None:
+                    labels[labels == token_id] = IGNORE_INDEX
             batch_inputs["labels"] = labels
 
 

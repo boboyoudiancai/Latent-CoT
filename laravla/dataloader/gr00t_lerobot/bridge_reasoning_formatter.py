@@ -17,6 +17,10 @@ class BridgeReasoningFormatter:
     include_bbox: bool = True
     include_action_tokens: bool = True
     include_img_next: bool = True
+    include_spatial: bool = False
+    spatial_base_token: str = "<spatial_base>"
+    spatial_wrist_token: str = "<spatial_wrist>"
+    spatial_count: int = 16
     thinking_token: str = "<|thinking|>"
     start_token: str = "<|start_of_thinking|>"
     end_token: str = "<|end_of_thinking|>"
@@ -230,15 +234,22 @@ class BridgeReasoningFormatter:
             return ""
         return "".join([self.img_next_token] * self.img_next_count)
 
+    def _spatial_span(self) -> str:
+        if not self.include_spatial or self.spatial_count <= 0:
+            return ""
+        base = "".join([self.spatial_base_token] * self.spatial_count)
+        wrist = "".join([self.spatial_wrist_token] * self.spatial_count)
+        return f"{base}{wrist}"
+
     def _append_img_next(self, text: str, before_action: bool = False) -> str:
         """
-        Append img_next tokens; kept for stage0/无action场景。
-        before_action 参数仅为兼容旧调用，实际逻辑在调用处控制顺序。
+        Append the ImageNext suffix followed by optional base/wrist spatial spans.
+        before_action is retained for compatibility with older callers.
         """
-        span = self._img_next_span()
-        if not span:
+        suffix = "".join(part for part in (self._img_next_span(), self._spatial_span()) if part)
+        if not suffix:
             return text
-        return f"{text} {span}".strip()
+        return f"{text} {suffix}".strip()
 
     def _iter_components(
         self,
