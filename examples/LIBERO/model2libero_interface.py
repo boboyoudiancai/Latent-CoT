@@ -129,6 +129,17 @@ class M1Inference:
         img_next_cfg = (model_config.get("framework", {}) or {}).get("img_next", {}) or {}
         self._include_img_next = bool(img_next_cfg.get("enable", False))
         self._img_next_token = str(img_next_cfg.get("token", "<img_next>"))
+
+        # Keep inference token order aligned with the spatial training formatter.
+        spatial_cfg = (model_config.get("framework", {}) or {}).get("spatial", {}) or {}
+        self._include_spatial = bool(bridge_cfg.get("include_spatial", spatial_cfg.get("enable", False)))
+        self._spatial_count = int(bridge_cfg.get("spatial_count", spatial_cfg.get("token_count", 16)))
+        self._spatial_base_token = str(
+            bridge_cfg.get("spatial_base_token", spatial_cfg.get("base_token", "<spatial_base>"))
+        )
+        self._spatial_wrist_token = str(
+            bridge_cfg.get("spatial_wrist_token", spatial_cfg.get("wrist_token", "<spatial_wrist>"))
+        )
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -191,6 +202,13 @@ class M1Inference:
             return ""
         return self._img_next_token * int(self.img_next_count)
 
+    def _spatial_span(self) -> str:
+        if (not self._include_spatial) or self._spatial_count <= 0:
+            return ""
+        base = self._spatial_base_token * self._spatial_count
+        wrist = self._spatial_wrist_token * self._spatial_count
+        return base + wrist
+
     def _format_instruction_with_latent(self, instruction: str) -> str:
         """
         Strictly aligned with training formatter and SimplerEnv:
@@ -205,9 +223,9 @@ class M1Inference:
         span = self._thinking_span()
         text = f"{prompt}. @ {span}"
 
-        img_next_span = self._img_next_span()
-        if img_next_span:
-            text = f"{text} {img_next_span}" if text else img_next_span
+        suffix = "".join(part for part in (self._img_next_span(), self._spatial_span()) if part)
+        if suffix:
+            text = f"{text} {suffix}" if text else suffix
         return text.strip()
 
 
