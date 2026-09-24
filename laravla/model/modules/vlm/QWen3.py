@@ -115,10 +115,16 @@ class _QWen3_VL_Interface(nn.Module):
         self.enable_spatial = bool(spatial_cfg.get("enable", False))
         self.spatial_base_token_id = None
         self.spatial_wrist_token_id = None
+        self.spatial_base_token = str(spatial_cfg.get("base_token", "<spatial_base>"))
+        self.spatial_wrist_token = str(spatial_cfg.get("wrist_token", "<spatial_wrist>"))
         self.spatial_target_tokens = int(spatial_cfg.get("token_count", 16))
         self.spatial_external_teacher = None
         self.spatial_align_projector: Optional[nn.Module] = None
         self.spatial_target_dim = int(spatial_cfg.get("target_dim", 2048))
+        bridge_cfg = ((config.get("datasets", {}) or {}).get("vla_data", {}) or {}).get("bridge_reasoning", {}) or {}
+        self.spatial_query_mode = str(bridge_cfg.get("spatial_query_mode", "legacy") or "legacy").strip().lower()
+        if self.spatial_query_mode not in {"legacy", "visual_prefix_joint"}:
+            raise ValueError(f"unsupported spatial_query_mode={self.spatial_query_mode!r}")
         self.spatial_use_teacher = bool(spatial_cfg.get("use_teacher", True)) if self.enable_spatial else False
         if self.enable_spatial:
             token_ids = self._add_spatial_tokens(self.processor.tokenizer, config)
@@ -594,15 +600,26 @@ class _QWen3_VL_Interface(nn.Module):
         allow = torch.tril(torch.ones((seq_len, seq_len), device=device, dtype=torch.bool))
         allow = allow.unsqueeze(0) & valid.unsqueeze(2) & valid.unsqueeze(1)
 
-        token_ids = (
-            getattr(self, "img_next_token_id", None),
-            getattr(self, "spatial_base_token_id", None),
-            getattr(self, "spatial_wrist_token_id", None),
-        )
-        for token_id in token_ids:
-            if token_id is None:
+        token_groups = [((getattr(self, "img_next_token_id", None),), 16)]
+        if self.spatial_query_mode == "visual_prefix_joint":
+            token_groups.append(
+                ((getattr(self, "spatial_base_token_id", None), getattr(self, "spatial_wrist_token_id", None)), 32)
+            )
+        else:
+            token_groups.extend(
+                [
+                    ((getattr(self, "spatial_base_token_id", None),), 16),
+                    ((getattr(self, "spatial_wrist_token_id", None),), 16),
+                ]
+            )
+
+        for token_ids, expected_count in token_groups:
+            token_ids = tuple(token_id for token_id in token_ids if token_id is not None)
+            if not token_ids:
                 continue
-            token_mask = (input_ids == int(token_id)) & valid
+            token_mask = torch.zeros_like(valid)
+            for token_id in token_ids:
+                token_mask |= (input_ids == int(token_id)) & valid
             has_token = token_mask.any(dim=1)
             positions = token_mask.to(torch.long) * idx
             end = positions.max(dim=1).values
@@ -610,7 +627,7 @@ class _QWen3_VL_Interface(nn.Module):
             start = end - count + 1
             block = torch.zeros_like(token_mask)
             for row in range(batch_size):
-                if bool(has_token[row]) and int(count[row]) == 16 and int(start[row]) >= 0:
+                if bool(has_token[row]) and int(count[row]) == expected_count and int(start[row]) >= 0:
                     block[row, int(start[row]): int(end[row]) + 1] = True
             if block.any():
                 allow = allow | (block.unsqueeze(2) & block.unsqueeze(1))
@@ -966,6 +983,20 @@ class _QWen3_VL_Interface(nn.Module):
             state_dict = pruned
         return super().load_state_dict(state_dict, strict=strict)
 
+    def _format_reasoning_prompt_for_mode(self, instruction: str) -> str:
+        """Keep the exploratory spatial prefix ahead of all language text."""
+        if self.spatial_query_mode != "visual_prefix_joint":
+            return format_reasoning_prompt(instruction)
+        prefix = (
+            self.spatial_base_token * self.spatial_target_tokens
+            + self.spatial_wrist_token * self.spatial_target_tokens
+        )
+        instruction = (instruction or "").strip()
+        if not instruction.startswith(prefix):
+            return format_reasoning_prompt(instruction)
+        language_text = instruction[len(prefix):].strip()
+        return f"{prefix} {format_reasoning_prompt(language_text)}".strip()
+
     def build_qwenvl_inputs(self, images, instructions, solutions=None, **kwargs):
         """
         Build model inputs from raw data (images + instructions + optional solutions).
@@ -1094,7 +1125,7 @@ class _QWen3_VL_Interface(nn.Module):
         for sample_idx, (imgs, instruction) in enumerate(zip(images, instructions)):
             content = [{"type": "image", "image": img} for img in imgs]
 
-            prompt = format_reasoning_prompt(instruction)
+            prompt = self._format_reasoning_prompt_for_mode(instruction)
 
             if action_tokens is not None and isinstance(action_tokens, (list, tuple)) and sample_idx < len(action_tokens):
                 act_text = action_tokens[sample_idx] or ""

@@ -21,6 +21,7 @@ class BridgeReasoningFormatter:
     spatial_base_token: str = "<spatial_base>"
     spatial_wrist_token: str = "<spatial_wrist>"
     spatial_count: int = 16
+    spatial_query_mode: str = "legacy"
     thinking_token: str = "<|thinking|>"
     start_token: str = "<|start_of_thinking|>"
     end_token: str = "<|end_of_thinking|>"
@@ -40,6 +41,12 @@ class BridgeReasoningFormatter:
             self.component_order = tuple(normalized) if normalized else default_order
         else:
             self.component_order = default_order
+        self.spatial_query_mode = str(self.spatial_query_mode or "legacy").strip().lower()
+        if self.spatial_query_mode not in {"legacy", "visual_prefix_joint"}:
+            raise ValueError(
+                "spatial_query_mode must be 'legacy' or 'visual_prefix_joint', "
+                f"got {self.spatial_query_mode!r}"
+            )
 
     def _bbox_to_str(self, bbox: np.ndarray, confidence: float) -> str:
         coords = " ".join(f"{float(x):.4f}" for x in bbox.tolist())
@@ -178,6 +185,19 @@ class BridgeReasoningFormatter:
             else:
                 explicit_parts.append(self._format_explicit_tag(tag, value, bbox_conf))
 
+        if self.spatial_query_mode == "visual_prefix_joint":
+            language_text = instruction
+            if explicit_parts:
+                explicit_text = " ".join(explicit_parts)
+                language_text = f"{language_text} {explicit_text}".strip()
+            if thinking_body:
+                thinking_span = f"{self.start_token}{thinking_body}{self.end_token}"
+                latent_text = f"{language_text}. @ {self._img_next_span()} {thinking_span}".strip()
+            else:
+                latent_text = self._append_img_next(language_text, before_action=False)
+            spatial_span = self._spatial_span()
+            return f"{spatial_span} {latent_text}".strip() if spatial_span else latent_text
+
         if thinking_body:
             thinking_span = f"{self.start_token}{thinking_body}{self.end_token}"
             if instruction:
@@ -189,7 +209,6 @@ class BridgeReasoningFormatter:
 
         if explicit_parts:
             text = f"{text} " + " ".join(explicit_parts) if text else " ".join(explicit_parts)
-        # 注意：action tokens 不再拼进自然语言文本；后续会在模型输入构造阶段以 token 级 suffix 追加。
         text = self._append_img_next(text, before_action=False)
         return text.strip()
 
@@ -242,14 +261,12 @@ class BridgeReasoningFormatter:
         return f"{base}{wrist}"
 
     def _append_img_next(self, text: str, before_action: bool = False) -> str:
-        """
-        Append the ImageNext suffix followed by optional base/wrist spatial spans.
-        before_action is retained for compatibility with older callers.
-        """
-        suffix = "".join(part for part in (self._img_next_span(), self._spatial_span()) if part)
-        if not suffix:
-            return text
-        return f"{text} {suffix}".strip()
+        """Append visual carrier tokens using the configured ordering mode."""
+        if self.spatial_query_mode == "visual_prefix_joint":
+            parts = [self._spatial_span(), text, self._img_next_span()]
+        else:
+            parts = [text, self._img_next_span(), self._spatial_span()]
+        return " ".join(part for part in parts if part).strip()
 
     def _iter_components(
         self,

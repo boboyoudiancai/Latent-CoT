@@ -140,6 +140,9 @@ class M1Inference:
         self._spatial_wrist_token = str(
             bridge_cfg.get("spatial_wrist_token", spatial_cfg.get("wrist_token", "<spatial_wrist>"))
         )
+        self._spatial_query_mode = str(bridge_cfg.get("spatial_query_mode", "legacy") or "legacy").strip().lower()
+        if self._spatial_query_mode not in {"legacy", "visual_prefix_joint"}:
+            raise ValueError(f"Unsupported spatial_query_mode={self._spatial_query_mode!r}")
         
 
     def _add_image_to_history(self, image: np.ndarray) -> None:
@@ -222,6 +225,12 @@ class M1Inference:
 
         span = self._thinking_span()
         text = f"{prompt}. @ {span}"
+
+        if self._spatial_query_mode == "visual_prefix_joint":
+            spatial_span = self._spatial_span()
+            img_next_span = self._img_next_span()
+            latent_text = f"{prompt}. @ {img_next_span} {span}".strip() if prompt else f"{img_next_span} {span}".strip()
+            return f"{spatial_span} {latent_text}".strip() if spatial_span else latent_text
 
         suffix = "".join(part for part in (self._img_next_span(), self._spatial_span()) if part)
         if suffix:

@@ -173,6 +173,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--spatial_input_size", type=int, default=518)
     parser.add_argument("--spatial_preprocess_mode", default="resize", choices=["resize", "crop", "pad"])
     parser.add_argument("--spatial_count", type=int, default=16)
+    parser.add_argument("--spatial_query_mode", default="legacy", choices=["legacy", "visual_prefix_joint"])
     parser.add_argument("--spatial_base_token", default="<spatial_base>")
     parser.add_argument("--spatial_wrist_token", default="<spatial_wrist>")
     parser.add_argument("--spatial_teacher_layer", type=int, default=-1)
@@ -728,6 +729,7 @@ def apply_stage4_base_init_contract(cfg, args: argparse.Namespace):
         "datasets.vla_data.bridge_reasoning.img_next_count": int(args.img_next_count),
         "datasets.vla_data.bridge_reasoning.include_spatial": bool(args.enable_spatial_tokens),
         "datasets.vla_data.bridge_reasoning.spatial_count": int(args.spatial_count),
+        "datasets.vla_data.bridge_reasoning.spatial_query_mode": str(args.spatial_query_mode),
         "datasets.vla_data.bridge_reasoning.spatial_base_token": str(args.spatial_base_token),
         "datasets.vla_data.bridge_reasoning.spatial_wrist_token": str(args.spatial_wrist_token),
         "datasets.vla_data.bridge_reasoning.component_order": component_order,
@@ -902,6 +904,7 @@ def apply_runtime_overrides(cfg, args: argparse.Namespace):
     cfg.datasets.vla_data.bridge_reasoning.img_next_count = int(args.img_next_count)
     cfg.datasets.vla_data.bridge_reasoning.include_spatial = bool(args.enable_spatial_tokens)
     cfg.datasets.vla_data.bridge_reasoning.spatial_count = int(args.spatial_count)
+    cfg.datasets.vla_data.bridge_reasoning.spatial_query_mode = str(args.spatial_query_mode)
     cfg.datasets.vla_data.bridge_reasoning.spatial_base_token = str(args.spatial_base_token)
     cfg.datasets.vla_data.bridge_reasoning.spatial_wrist_token = str(args.spatial_wrist_token)
     if args.enable_img_next and int(args.img_next_count) != 16:
