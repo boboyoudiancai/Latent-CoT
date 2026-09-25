@@ -103,6 +103,69 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         else:
             print(f"[Training Stage] full mode - All parameters trainable")
 
+    def attach_latent_decoder(
+        self,
+        decoder,
+        tokenizer,
+        component_order,
+        include_bbox: bool = True,
+        max_target_tokens: int = 128,
+        loss_weight: float = 0.0,
+        source_checkpoint: str = "",
+    ) -> None:
+        """Attach Stage-1's auxiliary decoder without saving it in the VLA state dict."""
+        for parameter in decoder.parameters():
+            parameter.requires_grad_(False)
+        decoder.train()
+        if hasattr(decoder, "model"):
+            decoder.model.eval()
+        object.__setattr__(self, "_latent_decoder", decoder)
+        object.__setattr__(self, "_latent_decoder_tokenizer", tokenizer)
+        object.__setattr__(self, "_latent_decoder_component_order", tuple(component_order))
+        object.__setattr__(self, "_latent_decoder_include_bbox", bool(include_bbox))
+        object.__setattr__(self, "_latent_decoder_max_target_tokens", int(max_target_tokens))
+        object.__setattr__(self, "_latent_decoder_loss_weight", float(loss_weight))
+        object.__setattr__(self, "_latent_decoder_source_checkpoint", str(source_checkpoint))
+        logger.info(
+            "[latent_decoder] attached frozen decoder loss_weight=%s source=%s",
+            loss_weight,
+            source_checkpoint,
+        )
+
+    def _compute_latent_decoder_loss(self, examples, vlm_outputs):
+        decoder = getattr(self, "_latent_decoder", None)
+        if decoder is None:
+            return None
+        latent_embeds = vlm_outputs.get("latent_embeds")
+        latent_attention_mask = vlm_outputs.get("latent_attention_mask")
+        if latent_embeds is None or latent_attention_mask is None:
+            raise RuntimeError(
+                "latent decoder is enabled, but forward_latent did not return latent embeddings"
+            )
+
+        from decoder.latent_text_decoder import build_latent_decoder_batch
+
+        decoder_batch = build_latent_decoder_batch(
+            examples=examples,
+            latent_embeds=latent_embeds,
+            latent_attention_mask=latent_attention_mask,
+            tokenizer=getattr(self, "_latent_decoder_tokenizer"),
+            component_order=getattr(self, "_latent_decoder_component_order"),
+            include_bbox=getattr(self, "_latent_decoder_include_bbox", True),
+            max_target_tokens=getattr(self, "_latent_decoder_max_target_tokens", 128),
+        )
+        if decoder_batch is None:
+            return None
+        decoder_outputs = decoder(
+            latent_prefix=decoder_batch.latent_prefix,
+            latent_prefix_attention_mask=decoder_batch.latent_prefix_attention_mask,
+            target_input_ids=decoder_batch.target_input_ids,
+            target_labels=decoder_batch.target_labels,
+            target_attention_mask=decoder_batch.target_attention_mask,
+            return_per_sample_loss=False,
+        )
+        return decoder_outputs["loss"]
+
     def load_state_dict(self, state_dict, strict: bool = True):
         """Load checkpoints while allowing Stage 2 to omit the spatial projector."""
         spatial_cfg = getattr(self.config.framework, "spatial", {}) if hasattr(self.config, "framework") else {}
@@ -180,6 +243,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 image_grid_thw=qwen_inputs.get("image_grid_thw"),
                 labels=qwen_inputs.get("labels"),  # May contain masked labels
                 position_ids=qwen_inputs.get("position_ids"),
+                return_latent_embeds=hasattr(self, "_latent_decoder"),
             )
             
             last_hidden = vlm_outputs['hidden_states']  # [B, L, H]
@@ -195,6 +259,12 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 )
                 last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
                 vlm_loss = qwenvl_outputs.loss if hasattr(qwenvl_outputs, 'loss') else None
+
+        latent_decoder_loss = (
+            self._compute_latent_decoder_loss(examples, vlm_outputs)
+            if use_iterative_forward and hasattr(self, "_latent_decoder")
+            else None
+        )
 
         backbone_attention_mask = qwen_inputs.get("attention_mask")
         if backbone_attention_mask is not None:
@@ -293,6 +363,12 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             if spatial_loss is not None:
                 result["spatial_loss"] = spatial_loss
                 result["total_loss"] = result["total_loss"] + spatial_loss_weight * spatial_loss
+            if latent_decoder_loss is not None:
+                result["decoder_loss"] = latent_decoder_loss
+                result["total_loss"] = (
+                    result["total_loss"]
+                    + getattr(self, "_latent_decoder_loss_weight", 0.0) * latent_decoder_loss
+                )
             return result
 
         elif self.training_stage == "action_only":
@@ -397,6 +473,12 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         if spatial_loss is not None:
             result["spatial_loss"] = spatial_loss
             result["total_loss"] = result["total_loss"] + spatial_loss_weight * spatial_loss
+        if latent_decoder_loss is not None:
+            result["decoder_loss"] = latent_decoder_loss
+            result["total_loss"] = (
+                result["total_loss"]
+                + getattr(self, "_latent_decoder_loss_weight", 0.0) * latent_decoder_loss
+            )
 
         return result
 

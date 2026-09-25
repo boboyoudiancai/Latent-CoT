@@ -105,6 +105,64 @@ def build_model(cfg) -> torch.nn.Module:
     return model
 
 
+def attach_auxiliary_latent_decoder(model, cfg, device: torch.device) -> None:
+    """Load Stage-1's FullQwen latent decoder for a frozen auxiliary loss."""
+    decoder_cfg = cfg.framework.get("latent_decoder", {})
+    if not bool(decoder_cfg.get("enable", False)):
+        return
+
+    checkpoint_path = str(decoder_cfg.get("checkpoint", "") or "").strip()
+    if not checkpoint_path:
+        raise ValueError("framework.latent_decoder.checkpoint is required when enabled")
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"latent decoder checkpoint not found: {checkpoint_path}")
+
+    from decoder.latent_text_decoder import FullQwenLatentTextDecoder
+    from laravla.model.modules.vlm import get_vlm_model
+
+    decoder_cfg_full = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+    decoder_base_vlm = str(
+        decoder_cfg.get("base_vlm", decoder_cfg_full.framework.qwenvl.base_vlm)
+    )
+    decoder_cfg_full.framework.qwenvl.base_vlm = decoder_base_vlm
+    decoder_cfg_full.framework.img_next.use_teacher = False
+    decoder_cfg_full.framework.spatial.use_teacher = False
+
+    decoder_iface = get_vlm_model(config=decoder_cfg_full)
+    decoder_qwen = decoder_iface.model.to(device=device, dtype=torch.bfloat16)
+    decoder_qwen.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    if hasattr(decoder_qwen, "enable_input_require_grads"):
+        decoder_qwen.enable_input_require_grads()
+    decoder_qwen.config.use_cache = False
+    decoder = FullQwenLatentTextDecoder(
+        qwen_model=decoder_qwen,
+        hidden_size=int(decoder_qwen.config.hidden_size),
+        vocab_size=int(decoder_qwen.lm_head.out_features),
+    ).to(device=device, dtype=torch.bfloat16)
+
+    payload = torch.load(checkpoint_path, map_location="cpu")
+    decoder_state = payload.get("decoder_state_dict", payload)
+    decoder.load_state_dict(decoder_state, strict=True)
+    decoder.eval()
+
+    bridge_cfg = cfg.datasets.vla_data.bridge_reasoning
+    component_order = str(getattr(bridge_cfg, "component_order", "SUBTASK,BBOX,REASON"))
+    component_order = [item.strip().upper() for item in component_order.split(",") if item.strip()]
+    model.attach_latent_decoder(
+        decoder=decoder,
+        tokenizer=decoder_iface.processor.tokenizer,
+        component_order=component_order,
+        include_bbox=bool(getattr(bridge_cfg, "include_bbox", True)),
+        max_target_tokens=int(decoder_cfg.get("max_target_tokens", 128)),
+        loss_weight=float(decoder_cfg.get("loss_weight", 0.02)),
+        source_checkpoint=checkpoint_path,
+    )
+    if accelerator is not None and accelerator.is_main_process:
+        logger.info("[latent_decoder] loaded decoder checkpoint=%s", checkpoint_path)
+
+
 # here changes need to 📦 encapsulate Dataloader
 from laravla.dataloader import build_dataloader
 
@@ -621,6 +679,11 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
         if "img_next_loss" in output_dict and output_dict["img_next_loss"] is not None:
             metrics["img_next_loss"] = output_dict["img_next_loss"].item()
+
+        if "spatial_loss" in output_dict and output_dict["spatial_loss"] is not None:
+            metrics["spatial_loss"] = output_dict["spatial_loss"].item()
+        if "decoder_loss" in output_dict and output_dict["decoder_loss"] is not None:
+            metrics["decoder_loss"] = output_dict["decoder_loss"].item()
         
         # Add total_loss for monitoring (ensures consistency with backward pass)
         metrics["total_loss"] = total_loss.item()
@@ -683,6 +746,7 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     # build model
     vla = build_framework(cfg)
+    attach_auxiliary_latent_decoder(vla, cfg, accelerator.device)
     # prepare data
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
 
