@@ -78,6 +78,16 @@ from accelerate.logging import get_logger
 logger = get_logger(__name__)
 
 
+def synchronized_barrier() -> None:
+    """Use the current rank's CUDA device for NCCL barriers."""
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier()
+
+
 def setup_directories(cfg) -> Path:
     """create output directory and save config"""
     cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
@@ -196,7 +206,7 @@ def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
 
     accelerator.dataloader_config.dispatch_batches = False
     if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+        synchronized_barrier()
 
     return vla_train_dataloader
 
@@ -540,7 +550,11 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
             # # evaluate model
             if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+                # All ranks must finish the training step before rank 0 runs
+                # inference-only evaluation; otherwise other ranks can enter
+                # the next DDP all-reduce while rank 0 is still evaluating.
+                synchronized_barrier()
+                step_metrics = self.eval_action_model(step_metrics, eval_examples=batch_vla)
 
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
@@ -553,6 +567,8 @@ class LaRA_VLA_Trainer(TrainerUtils):
                 and self.completed_steps >= self.min_save_step
                 and self.completed_steps > 0
             ):
+                # Keep rank-0-only checkpoint I/O outside the next DDP step.
+                synchronized_barrier()
                 self._save_checkpoint()
 
             # check termination condition
@@ -564,7 +580,7 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
         # execute evaluation step
 
-    def eval_action_model(self, step_metrics: dict = None) -> float:
+    def eval_action_model(self, step_metrics: dict = None, eval_examples=None) -> dict:
         """
         Evaluate the model on the given dataset using the specified metric function.
 
@@ -574,8 +590,9 @@ class LaRA_VLA_Trainer(TrainerUtils):
         """
 
         if self.accelerator.is_main_process:
-
-            examples = self._get_next_batch()
+            if eval_examples is None:
+                raise ValueError("eval_examples must be provided to avoid advancing the training iterator")
+            examples = eval_examples
 
             score = 0.0
             num_samples = len(examples)
@@ -604,7 +621,7 @@ class LaRA_VLA_Trainer(TrainerUtils):
             average_score = score / num_pots
             step_metrics["mse_score"] = average_score
         pass
-        dist.barrier()  # ensure all processes are synchronized
+        synchronized_barrier()  # ensure all processes are synchronized
         return step_metrics
 
     def _log_training_config(self):
@@ -692,6 +709,10 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
     def _finalize_training(self):
         """training end processing"""
+        # Do not let rank 0 write the final checkpoint while another rank is
+        # still finishing its last distributed training step.
+        synchronized_barrier()
+
         # save final model
         if self.accelerator.is_main_process:
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
@@ -771,7 +792,7 @@ def main(cfg) -> None:
 
     # And... we're done!
     logger.info("... and that's all, folks!")
-    dist.barrier()
+    synchronized_barrier()
     dist.destroy_process_group()
 
 

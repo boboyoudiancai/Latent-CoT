@@ -34,6 +34,7 @@ from laravla.model.framework.base_framework import baseframework
 from laravla.model.framework.latent_analysis_mixin import LatentAnalysisMixin
 from laravla.model.modules.vlm import get_vlm_model
 from laravla.model.modules.vlm.QWen3 import format_reasoning_prompt
+from laravla.model.framework.losses import compose_total_loss
 from laravla.model.modules.action_model.GR00T_ActionHeader import get_action_model, FlowmatchingActionHead
 from laravla.model.modules.action_model.fast_ActionHeader import Fast_Action_Tokenizer
 from laravla.training.trainer_utils.trainer_tools import resize_images
@@ -191,6 +192,10 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B， len, 7]
         action_tokens = [example.get("action_tokens", "") for example in examples]
+        train_obs_image_size = getattr(self.config.datasets.vla_data, "image_size", None)
+        if train_obs_image_size:
+            target_size = tuple(int(value) for value in train_obs_image_size)
+            batch_images = resize_images(batch_images, target_size=target_size)
         cot_mode = str(self.config.framework.get("cot_mode", "none")).lower()
         cot_solutions = None
         use_generated_cot = False
@@ -262,7 +267,11 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
 
         latent_decoder_loss = (
             self._compute_latent_decoder_loss(examples, vlm_outputs)
-            if use_iterative_forward and hasattr(self, "_latent_decoder")
+            if (
+                use_iterative_forward
+                and hasattr(self, "_latent_decoder")
+                and self.training_stage != "action_only"
+            )
             else None
         )
 
@@ -297,7 +306,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         )
 
         if (
-            enable_img_next
+            self.training_stage != "action_only"
+            and enable_img_next
             and use_img_next_teacher
             and img_next_token_id is not None
             and img_next_loss_weight is not None
@@ -332,7 +342,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         spatial_wrist_id = getattr(self.qwen_vl_interface, "spatial_wrist_token_id", None)
         spatial_loss = None
         if (
-            enable_spatial
+            self.training_stage != "action_only"
+            and enable_spatial
             and bool(spatial_cfg.get("use_teacher", True))
             and spatial_loss_weight > 0
             and spatial_base_id is not None
@@ -371,8 +382,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 )
             return result
 
-        elif self.training_stage == "action_only":
-            # action_only mode: Only train action head, VLM is frozen
+        elif self.training_stage in {"action_only", "action_plus_aux"}:
+            # action_only and action_plus_aux share the action head path
             with torch.autocast("cuda", dtype=torch.float32):
                 # 标签对齐：取最后 chunk_len 段
                 actions = torch.tensor(
@@ -411,10 +422,11 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 )
 
                 result["action_loss"] = action_loss
-                result["total_loss"] = action_loss  # Only action loss
-                if vlm_loss is not None:
-                    result["vlm_loss"] = vlm_loss
-                return result
+                if self.training_stage == "action_only":
+                    result["total_loss"] = action_loss
+                    if vlm_loss is not None:
+                        result["vlm_loss"] = vlm_loss
+                    return result
         else:
             # full mode: Train both VLM and action head
             with torch.autocast("cuda", dtype=torch.float32):
@@ -455,13 +467,9 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             result["action_loss"] = action_loss
             
             # Combine with VLM loss if available
+        vlm_loss_weight = self.config.framework.get("latent_reasoning", {}).get("vlm_loss_weight", 0.5)
         if vlm_loss is not None:
-            vlm_loss_weight = self.config.framework.get("latent_reasoning", {}).get("vlm_loss_weight", 0.5)
             result["vlm_loss"] = vlm_loss
-            result["total_loss"] = action_loss + vlm_loss_weight * vlm_loss
-        else:
-            result["total_loss"] = action_loss
-
         if (
             img_next_loss is not None
             and enable_img_next
@@ -469,16 +477,23 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             and img_next_loss_weight > 0
         ):
             result["img_next_loss"] = img_next_loss
-            result["total_loss"] = result["total_loss"] + img_next_loss_weight * img_next_loss
         if spatial_loss is not None:
             result["spatial_loss"] = spatial_loss
-            result["total_loss"] = result["total_loss"] + spatial_loss_weight * spatial_loss
         if latent_decoder_loss is not None:
             result["decoder_loss"] = latent_decoder_loss
-            result["total_loss"] = (
-                result["total_loss"]
-                + getattr(self, "_latent_decoder_loss_weight", 0.0) * latent_decoder_loss
-            )
+
+        result["total_loss"] = compose_total_loss(
+            self.training_stage,
+            action_loss,
+            vlm_loss=vlm_loss,
+            vlm_loss_weight=vlm_loss_weight,
+            img_next_loss=img_next_loss,
+            img_next_loss_weight=img_next_loss_weight,
+            spatial_loss=spatial_loss,
+            spatial_loss_weight=spatial_loss_weight,
+            decoder_loss=latent_decoder_loss,
+            decoder_loss_weight=getattr(self, "_latent_decoder_loss_weight", 0.0),
+        )
 
         return result
 
