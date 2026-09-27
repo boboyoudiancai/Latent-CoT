@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -175,6 +178,9 @@ class VGGTTeacher:
         patch_start_idx: int = 5,
         use_vggt_pe: bool = True,
         preprocess_mode: str = "resize",
+        cache_size: int = 0,
+        cache_dir: str = "",
+        cache_only: bool = False,
     ) -> None:
         if not teacher_repo:
             raise ValueError("framework.spatial.teacher_repo must point to a local VGGT repository")
@@ -184,6 +190,12 @@ class VGGTTeacher:
         self.patch_start_idx = int(patch_start_idx)
         self.use_vggt_pe = bool(use_vggt_pe)
         self.preprocess_mode = str(preprocess_mode)
+        self.cache_size = max(0, int(cache_size))
+        self._feature_cache = OrderedDict()
+        self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
+        self.cache_only = bool(cache_only)
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
         try:
             from vggt.models.vggt import VGGT
         except ImportError as exc:
@@ -259,8 +271,63 @@ class VGGTTeacher:
             features = features[self.layer]
         return features, patch_start_idx
 
+    def _image_cache_key(self, sample: Any, target_tokens: int, cache_key=None) -> bytes:
+        digest = hashlib.sha256()
+        digest.update(str((self.teacher_repo, self.input_size, self.layer, self.patch_start_idx, self.use_vggt_pe, self.preprocess_mode, int(target_tokens))).encode("utf-8"))
+        if cache_key is not None:
+            digest.update(str(cache_key).encode("utf-8"))
+            return digest.digest()
+        views = list(sample) if isinstance(sample, (list, tuple)) else [sample]
+        for view in views[:2]:
+            image = self._as_rgb(view)
+            digest.update(str(image.size).encode("ascii"))
+            digest.update(image.tobytes())
+        return digest.digest()
+
+    def _disk_cache_path(self, key: bytes):
+        if self.cache_dir is None:
+            return None
+        return self.cache_dir / (key.hex() + ".pt")
+
+    def _load_cached_target(self, key: bytes):
+        value = self._feature_cache.get(key)
+        if value is not None:
+            self._feature_cache.move_to_end(key)
+            return value
+        path = self._disk_cache_path(key)
+        if path is None or not path.is_file():
+            return None
+        try:
+            value = torch.load(path, map_location="cpu")
+            if not isinstance(value, torch.Tensor):
+                raise TypeError("cached VGGT target is not a tensor")
+        except Exception:
+            path.unlink(missing_ok=True)
+            return None
+        self._feature_cache[key] = value
+        self._feature_cache.move_to_end(key)
+        while len(self._feature_cache) > self.cache_size:
+            self._feature_cache.popitem(last=False)
+        return value
+
+    def _store_cached_target(self, key: bytes, value: torch.Tensor):
+        value = value.detach().cpu()
+        self._feature_cache[key] = value
+        self._feature_cache.move_to_end(key)
+        while len(self._feature_cache) > self.cache_size:
+            self._feature_cache.popitem(last=False)
+        path = self._disk_cache_path(key)
+        if path is None:
+            return
+        tmp = path.with_name(path.name + ".tmp." + str(os.getpid()))
+        try:
+            torch.save(value, tmp)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
     @torch.no_grad()
-    def encode(self, images: Sequence, device: torch.device, target_tokens: int) -> torch.Tensor:
+    def _encode_uncached(self, images: Sequence, device: torch.device, target_tokens: int) -> torch.Tensor:
         batch = self._prepare_views(images, device)
         self.encoder.to(device=device)
         self.encoder.eval()
@@ -280,3 +347,34 @@ class VGGTTeacher:
             raise ValueError(f"unsupported VGGT feature shape {tuple(features.shape)}")
         features = features[..., int(patch_start_idx):, :]
         return pool_vggt_tokens(features, int(target_tokens), self.use_vggt_pe).detach()
+
+    @torch.no_grad()
+    def encode(self, images: Sequence, device: torch.device, target_tokens: int, cache_keys=None) -> torch.Tensor:
+        if cache_keys is not None and len(cache_keys) != len(images):
+            raise ValueError("VGGT cache_keys length must match images length")
+        if self.cache_size <= 0 and self.cache_dir is None and not self.cache_only:
+            return self._encode_uncached(images, device, target_tokens)
+
+        keys = [
+            self._image_cache_key(sample, target_tokens, cache_key=cache_keys[index] if cache_keys is not None else None)
+            for index, sample in enumerate(images)
+        ]
+        cached = [self._load_cached_target(key) for key in keys]
+        missing_indices = [index for index, value in enumerate(cached) if value is None]
+        if missing_indices and self.cache_only:
+            missing_keys = [str(cache_keys[index]) if cache_keys is not None else keys[index].hex() for index in missing_indices]
+            raise FileNotFoundError(
+                "VGGT spatial cache miss in cache-only mode: " + ", ".join(missing_keys[:8])
+            )
+        if missing_indices:
+            missing_images = [images[index] for index in missing_indices]
+            computed = self._encode_uncached(missing_images, device, target_tokens)
+            for index, value in zip(missing_indices, computed):
+                key = keys[index]
+                self._store_cached_target(key, value)
+                cached[index] = value.detach().cpu()
+
+        return torch.stack(
+            [value.to(device=device, non_blocking=True) for value in cached],
+            dim=0,
+        )

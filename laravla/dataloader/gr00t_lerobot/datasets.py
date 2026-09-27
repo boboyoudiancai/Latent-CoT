@@ -1180,6 +1180,7 @@ class LeRobotSingleDataset(Dataset):
             image_next_fallback=fallback,
             episode_index=int(trajectory_id),
             frame_index=int(base_index),
+            spatial_cache_key=f"{getattr(self, 'dataset_name', 'dataset')}:{int(trajectory_id)}:{int(base_index)}",
             language=language,
             lang=language,
         )

@@ -194,6 +194,40 @@ class OneBlockLatentTextDecoder(nn.Module):
             "logits": target_logits,
         }
         if return_per_sample_loss:
+            per_sample_loss = latent_prefix.new_zeros((batch_size,), dtype=torch.float32)
+            with torch.no_grad():
+                for sample_idx in range(batch_size):
+                    valid_mask = target_labels[sample_idx].ne(IGNORE_INDEX)
+                    if valid_mask.any():
+                        target_embeds = self.input_embeddings(
+                            target_input_ids[sample_idx : sample_idx + 1]
+                        )
+                        inputs_embeds = torch.cat(
+                            [latent_prefix[sample_idx : sample_idx + 1], target_embeds],
+                            dim=1,
+                        )
+                        attention_mask = torch.cat(
+                            [
+                                latent_prefix_attention_mask[sample_idx : sample_idx + 1],
+                                target_attention_mask[sample_idx : sample_idx + 1],
+                            ],
+                            dim=1,
+                        )
+                        outputs = self.model.model(
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=attention_mask,
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                        predictor_hidden = outputs.last_hidden_state[:, prefix_len - 1 : -1, :]
+                        sample_logits = self.model.lm_head(
+                            predictor_hidden[0, valid_mask]
+                        ).float()
+                        per_sample_loss[sample_idx] = F.cross_entropy(
+                            sample_logits,
+                            target_labels[sample_idx, valid_mask],
+                            reduction="mean",
+                        )
             result["per_sample_loss"] = per_sample_loss.detach()
         return result
 
@@ -345,57 +379,112 @@ class FullQwenLatentTextDecoder(nn.Module):
         else:
             latent_prefix_attention_mask = latent_prefix_attention_mask.to(device=device, dtype=torch.bool)
 
-        target_embeds = self.input_embeddings(target_input_ids)
-        inputs_embeds = torch.cat([latent_prefix, target_embeds], dim=1)
-        attention_mask = torch.cat([latent_prefix_attention_mask, target_attention_mask], dim=1)
-
-        outputs = self.model.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            use_cache=False,
-            return_dict=True,
-        )
-        predictor_hidden = outputs.last_hidden_state[:, prefix_len - 1 : -1, :]
         valid_token_count = target_labels.ne(IGNORE_INDEX).sum().clamp_min(1)
 
-        def chunk_loss(hidden: torch.Tensor, chunk_labels: torch.Tensor) -> torch.Tensor:
-            chunk_logits = self.model.lm_head(hidden).float()
-            return F.cross_entropy(
-                chunk_logits.reshape(-1, self.vocab_size),
-                chunk_labels.reshape(-1),
-                ignore_index=IGNORE_INDEX,
-                reduction="sum",
-            )
+        # Group samples by target length so the frozen-Qwen forward does not
+        # process padding. The full loss remains token-normalized over the
+        # original batch, and the latent prefix remains differentiable.
+        target_lengths = target_attention_mask.long().sum(dim=1).clamp_min(1)
+        sorted_indices = torch.argsort(target_lengths, descending=True)
+        loss_sum = latent_prefix.new_zeros((), dtype=torch.float32)
+        micro_batch_size = 7
+        for start in range(0, batch_size, micro_batch_size):
+            end = min(start + micro_batch_size, batch_size)
+            batch_indices = sorted_indices[start:end]
+            target_len = int(target_lengths.index_select(0, batch_indices).max().item())
 
-        # The FP32 full-vocabulary CE tensor is the decoder's memory peak. Checkpointing
-        # small sample chunks preserves the exact token-mean loss while bounding that peak.
-        loss_sum = predictor_hidden.new_zeros((), dtype=torch.float32)
-        chunk_size = 2
-        for start in range(0, batch_size, chunk_size):
-            hidden_chunk = predictor_hidden[start : start + chunk_size]
-            labels_chunk = target_labels[start : start + chunk_size]
+            prefix_chunk = latent_prefix.index_select(0, batch_indices)
+            target_ids_chunk = target_input_ids.index_select(0, batch_indices)[:, :target_len]
+            target_labels_chunk = target_labels.index_select(0, batch_indices)[:, :target_len]
+            target_mask_chunk = target_attention_mask.index_select(0, batch_indices)[:, :target_len]
+            prefix_mask_chunk = latent_prefix_attention_mask.index_select(0, batch_indices)
+
+            def forward_chunk(
+                prefix_input: torch.Tensor,
+                target_ids: torch.Tensor,
+                prefix_mask: torch.Tensor,
+                target_mask: torch.Tensor,
+                labels: torch.Tensor,
+            ) -> torch.Tensor:
+                target_embeds = self.input_embeddings(target_ids)
+                inputs_embeds = torch.cat([prefix_input, target_embeds], dim=1)
+                attention_mask = torch.cat([prefix_mask, target_mask], dim=1)
+                outputs = self.model.model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                predictor_hidden = outputs.last_hidden_state[:, prefix_len - 1 : -1, :]
+                valid_mask = labels.ne(IGNORE_INDEX)
+                valid_hidden = predictor_hidden[valid_mask]
+                valid_labels = labels[valid_mask]
+                chunk_loss_sum = predictor_hidden.new_zeros((), dtype=torch.float32)
+                logit_row_chunk_size = 64
+                for row_start in range(0, valid_hidden.shape[0], logit_row_chunk_size):
+                    row_end = min(row_start + logit_row_chunk_size, valid_hidden.shape[0])
+                    chunk_logits = self.model.lm_head(
+                        valid_hidden[row_start:row_end]
+                    ).float()
+                    chunk_loss_sum = chunk_loss_sum + F.cross_entropy(
+                        chunk_logits,
+                        valid_labels[row_start:row_end],
+                        reduction="sum",
+                    )
+                return chunk_loss_sum
+
             if self.training and torch.is_grad_enabled():
                 loss_sum = loss_sum + checkpoint(
-                    chunk_loss,
-                    hidden_chunk,
-                    labels_chunk,
+                    forward_chunk,
+                    prefix_chunk,
+                    target_ids_chunk,
+                    prefix_mask_chunk,
+                    target_mask_chunk,
+                    target_labels_chunk,
                     use_reentrant=False,
                 )
             else:
-                loss_sum = loss_sum + chunk_loss(hidden_chunk, labels_chunk)
+                loss_sum = loss_sum + forward_chunk(
+                    prefix_chunk,
+                    target_ids_chunk,
+                    prefix_mask_chunk,
+                    target_mask_chunk,
+                    target_labels_chunk,
+                )
         loss = loss_sum / valid_token_count
         result = {
             "loss": loss,
             "logits": None,
         }
         if return_per_sample_loss:
-            per_sample_loss = predictor_hidden.new_zeros((batch_size,), dtype=torch.float32)
+            per_sample_loss = latent_prefix.new_zeros((batch_size,), dtype=torch.float32)
             with torch.no_grad():
                 for sample_idx in range(batch_size):
                     valid_mask = target_labels[sample_idx].ne(IGNORE_INDEX)
                     if valid_mask.any():
+                        target_embeds = self.input_embeddings(
+                            target_input_ids[sample_idx : sample_idx + 1]
+                        )
+                        inputs_embeds = torch.cat(
+                            [latent_prefix[sample_idx : sample_idx + 1], target_embeds],
+                            dim=1,
+                        )
+                        attention_mask = torch.cat(
+                            [
+                                latent_prefix_attention_mask[sample_idx : sample_idx + 1],
+                                target_attention_mask[sample_idx : sample_idx + 1],
+                            ],
+                            dim=1,
+                        )
+                        outputs = self.model.model(
+                            inputs_embeds=inputs_embeds,
+                            attention_mask=attention_mask,
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                        predictor_hidden = outputs.last_hidden_state[:, prefix_len - 1 : -1, :]
                         sample_logits = self.model.lm_head(
-                            predictor_hidden[sample_idx, valid_mask]
+                            predictor_hidden[0, valid_mask]
                         ).float()
                         per_sample_loss[sample_idx] = F.cross_entropy(
                             sample_logits,

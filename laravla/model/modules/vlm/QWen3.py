@@ -245,6 +245,9 @@ class _QWen3_VL_Interface(nn.Module):
                 patch_start_idx=int(spatial_cfg.get("patch_start_idx", 5)),
                 use_vggt_pe=bool(spatial_cfg.get("use_vggt_pe", True)),
                 preprocess_mode=str(spatial_cfg.get("preprocess_mode", "resize")),
+                cache_size=int(spatial_cfg.get("target_cache_size", 0) or 0),
+                cache_dir=str(spatial_cfg.get("target_cache_dir", "") or ""),
+                cache_only=bool(spatial_cfg.get("target_cache_only", False)),
             )
             target_dim = int(self.spatial_external_teacher.embed_dim)
         if not self.spatial_use_teacher:
@@ -274,11 +277,21 @@ class _QWen3_VL_Interface(nn.Module):
         projector = getattr(self, "spatial_align_projector", None)
         return projector(prediction) if projector is not None else prediction
 
-    def get_external_spatial_target(self, images, device: torch.device) -> torch.Tensor:
+    def get_external_spatial_target(
+        self,
+        images,
+        device: torch.device,
+        cache_keys=None,
+    ) -> torch.Tensor:
         teacher = getattr(self, "spatial_external_teacher", None)
         if teacher is None:
             raise RuntimeError("external VGGT spatial teacher is not initialized")
-        return teacher.encode(images=images, device=device, target_tokens=self.spatial_target_tokens)
+        return teacher.encode(
+            images=images,
+            device=device,
+            target_tokens=self.spatial_target_tokens,
+            cache_keys=cache_keys,
+        )
 
     def _init_img_next_vjepa_teacher(self, img_next_cfg) -> None:
         from .jepa_teacher import VJEPA21Teacher
