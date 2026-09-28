@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 from collections import OrderedDict
@@ -14,6 +15,50 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
+
+
+_PACKED_CACHE_FORMAT = "vggt-packed-bfloat16-v1"
+
+
+class _PackedVGGTShard:
+    """Read-only memory-mapped VGGT targets committed by a precompute worker."""
+
+    def __init__(self, manifest_path: Path) -> None:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        if manifest.get("format") != _PACKED_CACHE_FORMAT:
+            raise ValueError(f"unsupported VGGT packed-cache manifest: {manifest_path}")
+        self.manifest_path = manifest_path
+        self.data_path = manifest_path.parent / manifest["data_file"]
+        self.keys_path = manifest_path.parent / manifest["keys_file"]
+        self.count = int(manifest["count"])
+        self.sample_shape = tuple(int(value) for value in manifest["sample_shape"])
+        self.sample_numel = math.prod(self.sample_shape)
+        expected_bytes = self.count * self.sample_numel * 2
+        actual_bytes = self.data_path.stat().st_size
+        if actual_bytes != expected_bytes:
+            raise ValueError(
+                f"invalid VGGT packed-cache data size for {self.data_path}: "
+                f"expected {expected_bytes}, got {actual_bytes}"
+            )
+        self._tensor = None
+
+    def iter_keys(self):
+        with self.keys_path.open("r", encoding="ascii") as handle:
+            for row, line in enumerate(handle):
+                key_hex = line.strip()
+                if key_hex:
+                    yield row, bytes.fromhex(key_hex)
+
+    def get(self, row: int) -> torch.Tensor:
+        if self._tensor is None:
+            self._tensor = torch.from_file(
+                str(self.data_path),
+                shared=False,
+                size=self.count * self.sample_numel,
+                dtype=torch.bfloat16,
+            ).reshape(self.count, *self.sample_shape)
+        return self._tensor[int(row)]
 
 
 def _resize_vggt_tensor(image: torch.Tensor, target_size: int, mode: str = "crop") -> torch.Tensor:
@@ -194,8 +239,19 @@ class VGGTTeacher:
         self._feature_cache = OrderedDict()
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
         self.cache_only = bool(cache_only)
+        self._packed_shards = []
+        self._packed_index = {}
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._load_packed_cache_index()
+        self.transform = build_vggt_transform(self.input_size, self.preprocess_mode)
+        if self.cache_only and self._packed_shards:
+            feature_dims = {shard.sample_shape[-1] for shard in self._packed_shards}
+            if len(feature_dims) != 1:
+                raise ValueError(f"inconsistent VGGT feature dims across packed shards: {feature_dims}")
+            self.encoder = None
+            self.embed_dim = feature_dims.pop()
+            return
         try:
             from vggt.models.vggt import VGGT
         except ImportError as exc:
@@ -226,8 +282,30 @@ class VGGTTeacher:
             )
         self.encoder.requires_grad_(False)
         self.encoder.eval()
-        self.transform = build_vggt_transform(self.input_size, self.preprocess_mode)
+        aggregator = getattr(self.encoder, "aggregator", None)
+        if aggregator is not None and self.layer == -1 and hasattr(aggregator, "cached_layer_indices"):
+            aggregator.cached_layer_indices = {int(aggregator.depth) - 1}
         self.embed_dim = self._infer_embed_dim()
+
+    def _load_packed_cache_index(self) -> None:
+        manifest_paths = sorted(self.cache_dir.glob("packed_*.manifest.json"))
+        for manifest_path in manifest_paths:
+            shard = _PackedVGGTShard(manifest_path)
+            shard_index = len(self._packed_shards)
+            key_count = 0
+            for row, key in shard.iter_keys():
+                if row >= shard.count:
+                    raise ValueError(f"too many keys in VGGT cache shard: {manifest_path}")
+                if key in self._packed_index:
+                    raise ValueError(f"duplicate key across VGGT cache shards: {key.hex()}")
+                self._packed_index[key] = (shard_index, row)
+                key_count += 1
+            if key_count != shard.count:
+                raise ValueError(
+                    f"VGGT cache shard key count mismatch for {manifest_path}: "
+                    f"expected {shard.count}, got {key_count}"
+                )
+            self._packed_shards.append(shard)
 
     def _infer_embed_dim(self) -> int:
         aggregator = getattr(self.encoder, "aggregator", None)
@@ -294,6 +372,16 @@ class VGGTTeacher:
         if value is not None:
             self._feature_cache.move_to_end(key)
             return value
+        packed_location = self._packed_index.get(key)
+        if packed_location is not None:
+            shard_index, row = packed_location
+            value = self._packed_shards[shard_index].get(row)
+            if self.cache_size > 0:
+                self._feature_cache[key] = value
+                self._feature_cache.move_to_end(key)
+                while len(self._feature_cache) > self.cache_size:
+                    self._feature_cache.popitem(last=False)
+            return value
         path = self._disk_cache_path(key)
         if path is None or not path.is_file():
             return None
@@ -309,6 +397,10 @@ class VGGTTeacher:
         while len(self._feature_cache) > self.cache_size:
             self._feature_cache.popitem(last=False)
         return value
+
+    def cache_digest(self, sample: Any, target_tokens: int, cache_key=None) -> bytes:
+        """Return the exact cache key used by both packed and legacy caches."""
+        return self._image_cache_key(sample, target_tokens, cache_key=cache_key)
 
     def _store_cached_target(self, key: bytes, value: torch.Tensor):
         value = value.detach().cpu()
@@ -328,6 +420,8 @@ class VGGTTeacher:
 
     @torch.no_grad()
     def _encode_uncached(self, images: Sequence, device: torch.device, target_tokens: int) -> torch.Tensor:
+        if self.encoder is None:
+            raise RuntimeError("VGGT encoder is unavailable in packed cache-only mode")
         batch = self._prepare_views(images, device)
         self.encoder.to(device=device)
         self.encoder.eval()

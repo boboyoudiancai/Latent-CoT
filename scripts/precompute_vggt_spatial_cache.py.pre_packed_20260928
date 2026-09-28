@@ -1,0 +1,88 @@
+#!/usr/bin/env python
+import argparse
+from bisect import bisect_right
+from pathlib import Path
+
+import torch
+from omegaconf import OmegaConf
+from tqdm import tqdm
+
+from laravla.dataloader.lerobot_datasets import get_vla_dataset
+from laravla.model.modules.vlm.vggt_teacher import VGGTTeacher
+
+
+def build_underlying_index(dataset):
+    datasets = list(dataset.datasets)
+    offsets = [0]
+    for single_dataset in datasets:
+        single_dataset.transforms.eval()
+        offsets.append(offsets[-1] + len(single_dataset))
+    return datasets, offsets
+
+
+def get_underlying_sample(datasets, offsets, global_index):
+    dataset_index = bisect_right(offsets, global_index) - 1
+    single_dataset = datasets[dataset_index]
+    local_index = global_index - offsets[dataset_index]
+    trajectory_id, base_index = single_dataset.all_steps[local_index]
+    data = single_dataset.get_step_data(trajectory_id, base_index)
+    transformed = single_dataset.transforms(data)
+    return single_dataset._build_sample_from_data(transformed, trajectory_id, base_index)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_yaml", required=True)
+    parser.add_argument("--cache_dir", default="")
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--start", type=int, default=0)
+    parser.add_argument("--end", type=int, default=-1)
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args()
+
+    cfg = OmegaConf.load(args.config_yaml)
+    spatial = cfg.framework.spatial
+    cache_dir = args.cache_dir or str(spatial.target_cache_dir)
+    mixture = get_vla_dataset(data_cfg=cfg.datasets.vla_data, mode="train")
+    datasets, offsets = build_underlying_index(mixture)
+    total_samples = offsets[-1]
+    print(f"underlying_dataset_lengths={[len(dataset) for dataset in datasets]}")
+    print(f"underlying_total_samples={total_samples}")
+
+    teacher = VGGTTeacher(
+        teacher_repo=str(spatial.teacher_repo),
+        input_size=int(spatial.input_size),
+        layer=int(spatial.teacher_layer),
+        patch_start_idx=int(spatial.patch_start_idx),
+        use_vggt_pe=bool(spatial.use_vggt_pe),
+        preprocess_mode=str(spatial.preprocess_mode),
+        cache_size=1,
+        cache_dir=cache_dir,
+        cache_only=False,
+    )
+    end = total_samples if args.end < 0 else min(args.end, total_samples)
+    if args.start < 0 or args.start > end:
+        raise ValueError(f"invalid range start={args.start} end={end}")
+    device = torch.device(args.device)
+    total_batches = (end - args.start + args.batch_size - 1) // args.batch_size
+    for start in tqdm(range(args.start, end, args.batch_size), total=total_batches):
+        samples = [
+            get_underlying_sample(datasets, offsets, index)
+            for index in range(start, min(start + args.batch_size, end))
+        ]
+        images = [sample["image"] for sample in samples]
+        keys = [sample["spatial_cache_key"] for sample in samples]
+        teacher.encode(
+            images,
+            device=device,
+            target_tokens=int(spatial.token_count),
+            cache_keys=keys,
+        )
+    print(
+        f"precompute_complete samples={end - args.start} "
+        f"underlying_total={total_samples} cache_dir={cache_dir}"
+    )
+
+
+if __name__ == "__main__":
+    main()

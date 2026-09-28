@@ -20,6 +20,41 @@ import decord  # noqa: F401
 import numpy as np
 
 
+_KNOWN_CORRUPT_VIDEO_SUFFIX = (
+    "libero_goal_no_noops_1.0.0_lerobot/videos/chunk-000/"
+    "observation.images.image/episode_000082.mp4"
+)
+
+
+def _corrupt_video_placeholder(video_path: str, timestamps) -> np.ndarray:
+    if not str(video_path).endswith(_KNOWN_CORRUPT_VIDEO_SUFFIX):
+        raise ValueError(f"unable to decode video: {video_path}")
+    count = len(timestamps)
+    print(f"WARNING: using zero-frame placeholder for known corrupt video {video_path}", flush=True)
+    return np.zeros((count, 224, 224, 3), dtype=np.uint8)
+
+
+def _decode_av1_sequential(video_path: str, timestamps) -> np.ndarray:
+    container = av.open(video_path)
+    frames = []
+    frame_times = []
+    try:
+        target_time = float(np.max(np.asarray(timestamps, dtype=np.float64)))
+        for frame in container.decode(video=0):
+            frames.append(frame.to_ndarray(format="rgb24"))
+            frame_times.append(float(frame.time))
+            if frame_times[-1] >= target_time:
+                break
+    finally:
+        container.close()
+    if not frames:
+        raise ValueError(f"known AV1 video produced no frames: {video_path}")
+    frame_times = np.asarray(frame_times, dtype=np.float64)
+    indices = np.abs(frame_times[:, None] - np.asarray(timestamps)[None, :]).argmin(axis=0)
+    print(f"WARNING: sequentially decoded AV1 video after seek failure {video_path}", flush=True)
+    return np.stack([frames[int(index)] for index in indices], axis=0)
+
+
 def get_frames_by_indices(
     video_path: str,
     indices: list[int] | np.ndarray,
@@ -105,20 +140,43 @@ def get_frames_by_timestamps(
         # access closest key frame of the first requested frame
         # Note: closest key frame timestamp is usally smaller than `first_ts` (e.g. key frame can be the first frame of the video)
         # for details on what `seek` is doing see: https://pyav.basswood-io.com/docs/stable/api/container.html?highlight=inputcontainer#av.container.InputContainer.seek
-        reader.seek(first_ts, keyframes_only=True)
-        # load all frames until last requested frame
-        loaded_frames = []
-        loaded_ts = []
-        for frame in reader:
-            current_ts = frame["pts"]
-            loaded_frames.append(frame["data"])
-            loaded_ts.append(current_ts)
-            if current_ts >= last_ts:
-                break
-            if len(loaded_frames) >= len(timestamps):
-                break
-        reader.container.close()
-        reader = None
+        try:
+            reader.seek(first_ts, keyframes_only=True)
+            # load all frames until last requested frame
+            loaded_frames = []
+            loaded_ts = []
+            for frame in reader:
+                current_ts = frame["pts"]
+                loaded_frames.append(frame["data"])
+                loaded_ts.append(current_ts)
+                if current_ts >= last_ts:
+                    break
+                if len(loaded_frames) >= len(timestamps):
+                    break
+        except av.error.InvalidDataError:
+            try:
+                return get_frames_by_timestamps(
+                    video_path,
+                    timestamps,
+                    video_backend="decord",
+                    video_backend_kwargs=video_backend_kwargs,
+                )
+            except Exception:
+                try:
+                    return get_frames_by_timestamps(
+                        video_path,
+                        timestamps,
+                        video_backend="opencv",
+                        video_backend_kwargs=video_backend_kwargs,
+                    )
+                except Exception:
+                    try:
+                        return _decode_av1_sequential(video_path, timestamps)
+                    except Exception:
+                        return _corrupt_video_placeholder(video_path, timestamps)
+        finally:
+            reader.container.close()
+            reader = None
         frames = np.array(loaded_frames)
         return frames.transpose(0, 2, 3, 1)
     else:
