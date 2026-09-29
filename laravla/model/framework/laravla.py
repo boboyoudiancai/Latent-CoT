@@ -166,6 +166,98 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         )
         return decoder_outputs["loss"]
 
+    @torch.no_grad()
+    def evaluate_latent_decoder(self, examples, max_new_tokens: int = 64):
+        """Evaluate the attached decoder against the current VLM latent prefix."""
+        decoder = getattr(self, "_latent_decoder", None)
+        if decoder is None:
+            return None
+
+        from decoder.latent_text_decoder import build_latent_decoder_batch
+
+        tokenizer = getattr(self, "_latent_decoder_tokenizer")
+        batch_images = [example["image"] for example in examples]
+        instructions = [example["lang"] for example in examples]
+        action_tokens = [example.get("action_tokens", "") for example in examples]
+
+        decoder_was_training = decoder.training
+        decoder.eval()
+        try:
+            qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+                images=batch_images,
+                instructions=instructions,
+                solutions=None,
+                action_tokens=action_tokens,
+            )
+            vlm_outputs = self.qwen_vl_interface.forward_latent(
+                input_ids=qwen_inputs["input_ids"],
+                attention_mask=qwen_inputs["attention_mask"],
+                pixel_values=qwen_inputs.get("pixel_values"),
+                image_grid_thw=qwen_inputs.get("image_grid_thw"),
+                labels=None,
+                position_ids=qwen_inputs.get("position_ids"),
+                return_latent_embeds=True,
+            )
+            decoder_batch = build_latent_decoder_batch(
+                examples=examples,
+                latent_embeds=vlm_outputs["latent_embeds"],
+                latent_attention_mask=vlm_outputs["latent_attention_mask"],
+                tokenizer=tokenizer,
+                component_order=getattr(self, "_latent_decoder_component_order"),
+                include_bbox=getattr(self, "_latent_decoder_include_bbox", True),
+                max_target_tokens=getattr(self, "_latent_decoder_max_target_tokens", 128),
+            )
+            if decoder_batch is None:
+                return None
+
+            decoder_outputs = decoder(
+                latent_prefix=decoder_batch.latent_prefix,
+                latent_prefix_attention_mask=decoder_batch.latent_prefix_attention_mask,
+                target_input_ids=decoder_batch.target_input_ids,
+                target_labels=decoder_batch.target_labels,
+                target_attention_mask=decoder_batch.target_attention_mask,
+                return_per_sample_loss=False,
+            )
+
+            bos_id = tokenizer.bos_token_id
+            if bos_id is None:
+                bos_id = tokenizer.eos_token_id
+            if bos_id is None:
+                bos_id = tokenizer.pad_token_id
+            if bos_id is None:
+                raise ValueError("latent decoder tokenizer has no BOS, EOS, or PAD token")
+
+            decoded_ids = decoder.greedy_decode(
+                latent_prefix=decoder_batch.latent_prefix,
+                latent_prefix_attention_mask=decoder_batch.latent_prefix_attention_mask,
+                bos_token_id=int(bos_id),
+                eos_token_id=(
+                    int(tokenizer.eos_token_id)
+                    if tokenizer.eos_token_id is not None
+                    else None
+                ),
+                pad_token_id=(
+                    int(tokenizer.pad_token_id)
+                    if tokenizer.pad_token_id is not None
+                    else None
+                ),
+                max_new_tokens=max(1, int(max_new_tokens)),
+            )
+            return {
+                "loss": decoder_outputs["loss"],
+                "decoded_texts": tokenizer.batch_decode(
+                    decoded_ids,
+                    skip_special_tokens=True,
+                ),
+                "target_texts": list(decoder_batch.target_texts),
+                "tags": list(decoder_batch.tags),
+                "num_samples": len(decoder_batch.target_texts),
+            }
+        finally:
+            decoder.train(decoder_was_training)
+            if decoder_was_training and hasattr(decoder, "model"):
+                decoder.model.eval()
+
     def load_state_dict(self, state_dict, strict: bool = True):
         """Load checkpoints while allowing Stage 2 to omit the spatial projector."""
         spatial_cfg = getattr(self.config.framework, "spatial", {}) if hasattr(self.config, "framework") else {}
@@ -501,18 +593,23 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         wrist_mask: torch.Tensor,
     ) -> Optional[torch.Tensor]:
         """Align base/wrist special-token hidden states to pooled VGGT features."""
-        if last_hidden is None or not torch.any(base_mask) or not torch.any(wrist_mask):
-            return None
+        if last_hidden is None:
+            raise ValueError("spatial supervision requires VLM hidden states")
         batch_size = last_hidden.shape[0]
-        base_count = int(base_mask.sum(dim=1).max().item())
-        wrist_count = int(wrist_mask.sum(dim=1).max().item())
-        if base_count != wrist_count or base_count != int(
-            getattr(self.qwen_vl_interface, "spatial_target_tokens", 16)
+        expected_count = int(getattr(self.qwen_vl_interface, "spatial_target_tokens", 16))
+        base_counts = base_mask.sum(dim=1)
+        wrist_counts = wrist_mask.sum(dim=1)
+        if not torch.all(base_counts == expected_count) or not torch.all(
+            wrist_counts == expected_count
         ):
             raise ValueError(
-                f"spatial token count mismatch: base={base_count}, wrist={wrist_count}, "
-                f"expected={getattr(self.qwen_vl_interface, 'spatial_target_tokens', 16)}"
+                "spatial token count mismatch: "
+                f"base={base_counts.detach().cpu().tolist()}, "
+                f"wrist={wrist_counts.detach().cpu().tolist()}, "
+                f"expected_per_sample={expected_count}"
             )
+        base_count = expected_count
+        wrist_count = expected_count
         pred_base = last_hidden[base_mask].view(batch_size, base_count, -1)
         pred_wrist = last_hidden[wrist_mask].view(batch_size, wrist_count, -1)
         pred = torch.stack([pred_base, pred_wrist], dim=1)

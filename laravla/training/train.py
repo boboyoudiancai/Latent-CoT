@@ -448,6 +448,7 @@ class LaRA_VLA_Trainer(TrainerUtils):
     def _save_checkpoint(self):
         """save current training state"""
 
+        self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
 
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
@@ -526,7 +527,8 @@ class LaRA_VLA_Trainer(TrainerUtils):
             t_end_model = time.perf_counter()
 
             # update progress
-            if self.accelerator.sync_gradients:
+            did_optimizer_step = bool(self.accelerator.sync_gradients)
+            if did_optimizer_step:
                 progress_bar.update(1)
                 self.completed_steps += 1
             
@@ -538,21 +540,40 @@ class LaRA_VLA_Trainer(TrainerUtils):
                         }
                     )
 
-            # # evaluate model
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
-                step_metrics = self.eval_action_model(step_metrics)
+            eval_interval = int(getattr(self.config.trainer, "eval_interval", 0) or 0)
+            if (
+                did_optimizer_step
+                and eval_interval > 0
+                and self.completed_steps > 0
+                and self.completed_steps % eval_interval == 0
+            ):
+                self.accelerator.wait_for_everyone()
+                step_metrics = self.eval_action_model(
+                    step_metrics,
+                    eval_examples=batch_vla,
+                )
+                self.accelerator.wait_for_everyone()
+
+            save_interval = int(getattr(self.config.trainer, "save_interval", 0) or 0)
+            save_due = (
+                did_optimizer_step
+                and save_interval > 0
+                and self.completed_steps >= self.min_save_step
+                and self.completed_steps > 0
+                and self.completed_steps % save_interval == 0
+            )
+            if save_due:
+                decoder_metrics = self.eval_latent_decoder(batch_vla)
+                step_metrics.update(decoder_metrics)
 
             # record metrics
             step_metrics["data_time"] = t_end_data - t_start_data
             step_metrics["model_time"] = t_end_model - t_start_model
-            self._log_metrics(step_metrics)
+            if did_optimizer_step:
+                self._log_metrics(step_metrics)
 
             # save checkpoint
-            if (
-                self.completed_steps % self.config.trainer.save_interval == 0
-                and self.completed_steps >= self.min_save_step
-                and self.completed_steps > 0
-            ):
+            if save_due:
                 self._save_checkpoint()
 
             # check termination condition
@@ -564,7 +585,8 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
         # execute evaluation step
 
-    def eval_action_model(self, step_metrics: dict = None) -> float:
+    @torch.no_grad()
+    def eval_action_model(self, step_metrics: dict = None, eval_examples=None) -> dict:
         """
         Evaluate the model on the given dataset using the specified metric function.
 
@@ -573,39 +595,115 @@ class LaRA_VLA_Trainer(TrainerUtils):
         :return: Average metric score across the evaluation dataset.
         """
 
+        if eval_examples is None:
+            raise ValueError("eval_examples must be provided at an optimizer-step boundary")
+
+        batch_images = [example["image"] for example in eval_examples]
+        instructions = [example["lang"] for example in eval_examples]
+        actions = [example["action"] for example in eval_examples]
+        states = (
+            [example["state"] for example in eval_examples]
+            if "state" in eval_examples[0]
+            else None
+        )
+
+        # Keep the distributed training module in train mode. Switching the
+        # full Qwen/DeepSpeed tree to eval and back mutates multimodal runtime
+        # state used by the next iterative latent forward. no_grad already
+        # prevents this diagnostic action rollout from building a graph.
+        output_dict = self.model.predict_action(
+            batch_images=batch_images,
+            instructions=instructions,
+            state=states,
+            use_ddim=True,
+            num_ddim_steps=20,
+        )
+
+        normalized_actions = output_dict["normalized_actions"]
+        actions = np.array(actions)
+        local_score = float(TrainerUtils.euclidean_distance(normalized_actions, actions))
+        local_count = float(np.prod(actions.shape))
+        totals = torch.tensor(
+            [local_score, local_count],
+            device=self.accelerator.device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        step_metrics["mse_score"] = (totals[0] / totals[1].clamp_min(1.0)).item()
+        return step_metrics
+
+    @torch.no_grad()
+    def eval_latent_decoder(self, examples) -> dict:
+        """Run a synchronized decoder eval before each checkpoint save."""
+        decoder_cfg = self.config.framework.get("latent_decoder", {})
+        if not bool(decoder_cfg.get("enable", False)):
+            return {}
+        if not bool(decoder_cfg.get("eval_on_save", True)):
+            return {}
+
+        model = self.accelerator.unwrap_model(self.model)
+        if not hasattr(model, "evaluate_latent_decoder"):
+            raise RuntimeError("latent decoder is enabled but evaluation is unavailable")
+
+        result = model.evaluate_latent_decoder(
+            examples,
+            max_new_tokens=int(decoder_cfg.get("eval_decode_tokens", 64) or 64),
+        )
+        local_count = int(result["num_samples"]) if result is not None else 0
+        local_loss_sum = (
+            float(result["loss"].item()) * local_count
+            if result is not None and local_count > 0
+            else 0.0
+        )
+        totals = torch.tensor(
+            [local_loss_sum, float(local_count)],
+            device=self.accelerator.device,
+            dtype=torch.float64,
+        )
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        if totals[1].item() <= 0:
+            self.accelerator.wait_for_everyone()
+            return {}
+        eval_loss = (totals[0] / totals[1].clamp_min(1.0)).item()
+
         if self.accelerator.is_main_process:
-
-            examples = self._get_next_batch()
-
-            score = 0.0
-            num_samples = len(examples)
-
-            batch_images = [example["image"] for example in examples]
-            instructions = [example["lang"] for example in examples]  # [B, str]
-            actions = [example["action"] for example in examples]  # label
-            states = [example["state"] for example in examples] if "state" in examples[0] else None
-
-            # Predict actions using the model
-            output_dict = self.model.predict_action(
-                batch_images=batch_images,
-                instructions=instructions,
-                state=states,
-                use_ddim=True,
-                num_ddim_steps=20,
+            sample_limit = max(0, int(decoder_cfg.get("eval_samples", 4) or 0))
+            samples = []
+            if result is not None:
+                for tag, decoded, target in zip(
+                    result["tags"],
+                    result["decoded_texts"],
+                    result["target_texts"],
+                ):
+                    if len(samples) >= sample_limit:
+                        break
+                    samples.append(
+                        {
+                            "tag": tag,
+                            "decoded": " ".join((decoded or "").replace("\n", " ").split()),
+                            "target": target,
+                        }
+                    )
+            record = {
+                "step": self.completed_steps,
+                "eval_decoder_loss": eval_loss,
+                "num_eval_samples_global": int(totals[1].item()),
+                "samples": samples,
+            }
+            output_path = os.path.join(
+                self.config.output_dir,
+                "decoder_eval_samples.jsonl",
+            )
+            with open(output_path, "a", encoding="utf-8") as output_file:
+                output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            logger.info(
+                "Step %s, decoder eval loss: %.6f",
+                self.completed_steps,
+                eval_loss,
             )
 
-            normalized_actions = output_dict["normalized_actions"]  # B, T, D
-
-            actions = np.array(actions)  # convert actions to numpy.ndarray
-            # B, Chunk, dim = actions.shape
-            num_pots = np.prod(actions.shape)
-            # Compute the metric score
-            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
-            average_score = score / num_pots
-            step_metrics["mse_score"] = average_score
-        pass
-        dist.barrier()  # ensure all processes are synchronized
-        return step_metrics
+        self.accelerator.wait_for_everyone()
+        return {"eval_decoder_loss": eval_loss}
 
     def _log_training_config(self):
         """record training config"""
@@ -692,6 +790,7 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
     def _finalize_training(self):
         """training end processing"""
+        self.accelerator.wait_for_everyone()
         # save final model
         if self.accelerator.is_main_process:
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
@@ -744,6 +843,7 @@ def main(cfg) -> None:
 
     # create output directory and save config
     output_dir = setup_directories(cfg=cfg)
+    accelerator.wait_for_everyone()
     # build model
     vla = build_framework(cfg)
     attach_auxiliary_latent_decoder(vla, cfg, accelerator.device)

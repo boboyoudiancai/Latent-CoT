@@ -185,8 +185,9 @@ class _QWen3_VL_Interface(nn.Module):
         if external_teacher is not None:
             external_teacher.encoder.eval()
         spatial_teacher = getattr(self, "spatial_external_teacher", None)
-        if spatial_teacher is not None:
-            spatial_teacher.encoder.eval()
+        spatial_encoder = getattr(spatial_teacher, "encoder", None)
+        if spatial_encoder is not None:
+            spatial_encoder.eval()
         return result
 
     def _add_spatial_tokens(self, tokenizer, cfg):
