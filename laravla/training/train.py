@@ -277,6 +277,11 @@ def sync_bridge_reasoning_to_framework(cfg):
     if not getattr(bridge_cfg, "enable", False):
         return
 
+    raw_enable_latent = cfg.framework.get("enable_latent_reasoning", True)
+    enable_latent = raw_enable_latent.strip().lower() in {"1", "true", "yes", "on"} \
+        if isinstance(raw_enable_latent, str) else bool(raw_enable_latent)
+    if not enable_latent:
+        return
     cfg.framework.enable_latent_reasoning = True
 
     latent_cfg = getattr(cfg.framework, "latent_reasoning", None)
@@ -810,19 +815,34 @@ def main(cfg) -> None:
     logger.info("ECoT VLA Training :: Warming Up")
     accelerator = build_accelerator(cfg)
 
-    mode_flags = get_implicit_flags()
-
-    # Inject derived flags into cfg
-    cfg.framework.enable_latent_reasoning = True
-    cfg.framework.emit_thinking_tokens = False
-    cfg.framework.cot_mode = "implicit"
-    cfg.framework.cot_mode_flags = mode_flags
-
     training_stage = getattr(cfg.framework, "training_stage", "full")
-    if training_stage == "full":
+    raw_enable_latent = cfg.framework.get("enable_latent_reasoning", True)
+    enable_latent = raw_enable_latent.strip().lower() in {"1", "true", "yes", "on"} \
+        if isinstance(raw_enable_latent, str) else bool(raw_enable_latent)
+
+    if enable_latent:
+        mode_flags = get_implicit_flags()
+        cfg.framework.enable_latent_reasoning = True
+        cfg.framework.emit_thinking_tokens = False
+        cfg.framework.cot_mode = "implicit"
+        cfg.framework.cot_mode_flags = mode_flags
+    else:
+        mode_flags = {
+            "enable_latent_reasoning": False,
+            "emit_thinking_tokens": False,
+            "use_iterative_forward": False,
+            "generate_thinking": False,
+            "reasoning_stage": int(cfg.datasets.vla_data.bridge_reasoning.stage),
+        }
+        cfg.framework.enable_latent_reasoning = False
+        cfg.framework.emit_thinking_tokens = False
+        cfg.framework.cot_mode = "none"
+        cfg.framework.cot_mode_flags = mode_flags
+
+    if enable_latent and training_stage == "full":
         cfg.datasets.vla_data.bridge_reasoning.stage = mode_flags["reasoning_stage"]
 
-    logger.info(f"[Implicit Reasoning] training_stage={training_stage}, flags={mode_flags}")
+    logger.info(f"[Reasoning Mode] training_stage={training_stage}, flags={mode_flags}")
 
     sync_bridge_reasoning_to_framework(cfg)
 

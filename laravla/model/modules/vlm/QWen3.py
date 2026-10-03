@@ -577,6 +577,19 @@ class _QWen3_VL_Interface(nn.Module):
         """
         Forward pass delegating to underlying Qwen2.5-VL backbone.
         """
+        input_ids = kwargs.get("input_ids")
+        attention_mask = kwargs.get("attention_mask")
+        if (
+            self._should_enable_img_next_full_attention()
+            and isinstance(input_ids, torch.Tensor)
+            and isinstance(attention_mask, torch.Tensor)
+            and input_ids.ndim == 2
+            and attention_mask.ndim == 2
+        ):
+            kwargs["attention_mask"] = self._build_img_next_full_attention_mask(
+                attention_mask=attention_mask,
+                input_ids=input_ids,
+            )
 
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.model(

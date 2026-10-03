@@ -452,17 +452,23 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
 
         if self.training_stage == "reasoning_only":
             # Stage 1: Only train VLM reasoning, skip action head
-            if vlm_loss is None:
+            if (
+                vlm_loss is None
+                and img_next_loss is None
+                and spatial_loss is None
+                and latent_decoder_loss is None
+            ):
                 raise ValueError(
-                    "training_stage='reasoning_only' requires VLM loss, but vlm_loss is None. "
-                    "Please ensure enable_latent_reasoning=True and labels are provided."
+                    "training_stage='reasoning_only' requires at least one active "
+                    "VLM, ImageNext, spatial, or decoder loss."
                 )
-            result["vlm_loss"] = vlm_loss
+            result["total_loss"] = last_hidden.new_zeros((), dtype=torch.float32)
+            if vlm_loss is not None:
+                result["vlm_loss"] = vlm_loss
+                result["total_loss"] = result["total_loss"] + vlm_loss
             if img_next_loss is not None:
                 result["img_next_loss"] = img_next_loss
-                result["total_loss"] = vlm_loss + img_next_loss_weight * img_next_loss
-            else:
-                result["total_loss"] = vlm_loss
+                result["total_loss"] = result["total_loss"] + img_next_loss_weight * img_next_loss
             if spatial_loss is not None:
                 result["spatial_loss"] = spatial_loss
                 result["total_loss"] = result["total_loss"] + spatial_loss_weight * spatial_loss
