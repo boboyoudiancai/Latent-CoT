@@ -264,9 +264,13 @@ class BridgeReasoningFormatter:
         """Append visual carrier tokens using the configured ordering mode."""
         if self.spatial_query_mode == "visual_prefix_joint":
             parts = [self._spatial_span(), text, self._img_next_span()]
-        else:
-            parts = [text, self._img_next_span(), self._spatial_span()]
-        return " ".join(part for part in parts if part).strip()
+            return " ".join(part for part in parts if part).strip()
+
+        # Legacy Full checkpoints use one contiguous ImageNext/spatial carrier span.
+        suffix = "".join(part for part in (self._img_next_span(), self._spatial_span()) if part)
+        if not suffix:
+            return text.strip()
+        return f"{text} {suffix}".strip() if text else suffix
 
     def _iter_components(
         self,

@@ -115,6 +115,7 @@ def _build_model(config: Dict, host: str, port: int):
         cot_mode=config["cot_mode"],
         thinking_token_count=config["thinking_token_count"],
         img_next_count=config["img_next_count"],
+        legacy_img_spatial_boundary=config["legacy_img_spatial_boundary"],
         action_decode_mode=config["action_decode_mode"],
         fast_max_new_tokens=config["fast_max_new_tokens"],
     )
@@ -758,6 +759,12 @@ def _build_argparser():
     p.add_argument("--cot-mode", default="implicit")
     p.add_argument("--thinking-token-count", type=int, default=-1)
     p.add_argument("--img-next-count", type=int, default=-1)
+    p.add_argument(
+        "--legacy-img-spatial-boundary",
+        choices=("contiguous", "separated"),
+        default="contiguous",
+        help="Use separated only for historical Full Aux checkpoints trained with that boundary.",
+    )
     p.add_argument("--action-decode-mode", choices=("diffusion", "fast", "mlp"), default="diffusion")
     p.add_argument("--fast-max-new-tokens", type=int, default=256)
     p.add_argument("--num-processes", type=int, default=0)

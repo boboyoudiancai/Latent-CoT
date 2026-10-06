@@ -35,6 +35,7 @@ class M1Inference:
         cot_mode: str = "implicit",
         thinking_token_count: int = -1,
         img_next_count: int = -1,
+        legacy_img_spatial_boundary: str = "contiguous",
         action_decode_mode: str = "diffusion",
         fast_max_new_tokens: int = 256,
         # Testing utility: allow init without connecting websocket server
@@ -49,6 +50,11 @@ class M1Inference:
         if self.action_decode_mode not in {"diffusion", "fast", "mlp"}:
             raise ValueError(f"Unsupported action_decode_mode={action_decode_mode!r}")
         self.fast_max_new_tokens = int(fast_max_new_tokens)
+        self._legacy_img_spatial_boundary = str(legacy_img_spatial_boundary or "contiguous").strip().lower()
+        if self._legacy_img_spatial_boundary not in {"contiguous", "separated"}:
+            raise ValueError(
+                "legacy_img_spatial_boundary must be 'contiguous' or 'separated'"
+            )
 
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
@@ -220,22 +226,38 @@ class M1Inference:
           - ensure <img_next> is the last segment (no trailing text after it)
         """
         prompt = (instruction or "").strip()
-        if (not self.enable_latent_reasoning) or (self.cot_mode != "implicit"):
-            return prompt
+        if self.enable_latent_reasoning and self.cot_mode == "implicit":
+            span = self._thinking_span()
+            text = f"{prompt}. @ {span}"
 
-        span = self._thinking_span()
-        text = f"{prompt}. @ {span}"
+            if self._spatial_query_mode == "visual_prefix_joint":
+                spatial_span = self._spatial_span()
+                img_next_span = self._img_next_span()
+                latent_text = (
+                    f"{prompt}. @ {img_next_span} {span}".strip()
+                    if prompt
+                    else f"{img_next_span} {span}".strip()
+                )
+                return f"{spatial_span} {latent_text}".strip() if spatial_span else latent_text
 
-        if self._spatial_query_mode == "visual_prefix_joint":
+            separator = " " if self._legacy_img_spatial_boundary == "separated" else ""
+            suffix = separator.join(
+                part for part in (self._img_next_span(), self._spatial_span()) if part
+            )
+            if suffix:
+                text = f"{text} {suffix}" if text else suffix
+            return text.strip()
+        elif (
+            not self.enable_latent_reasoning
+            and self.cot_mode == "none"
+            and self._include_spatial
+        ):
             spatial_span = self._spatial_span()
-            img_next_span = self._img_next_span()
-            latent_text = f"{prompt}. @ {img_next_span} {span}".strip() if prompt else f"{img_next_span} {span}".strip()
-            return f"{spatial_span} {latent_text}".strip() if spatial_span else latent_text
-
-        suffix = "".join(part for part in (self._img_next_span(), self._spatial_span()) if part)
-        if suffix:
-            text = f"{text} {suffix}" if text else suffix
-        return text.strip()
+            if self._spatial_query_mode == "visual_prefix_joint":
+                return f"{spatial_span} {prompt}".strip()
+            return f"{prompt} {spatial_span}".strip()
+        else:
+            return prompt
 
 
     def step(
