@@ -312,6 +312,7 @@ class LeRobotSingleDataset(Dataset):
             spatial_wrist_token = reasoning_cfg.get("spatial_wrist_token", "<spatial_wrist>") if isinstance(reasoning_cfg, dict) else "<spatial_wrist>"
             spatial_count = int(reasoning_cfg.get("spatial_count", 16)) if isinstance(reasoning_cfg, dict) else 16
             spatial_query_mode = reasoning_cfg.get("spatial_query_mode", "legacy") if isinstance(reasoning_cfg, dict) else "legacy"
+            spatial_view_mode = reasoning_cfg.get("spatial_view_mode", "dual") if isinstance(reasoning_cfg, dict) else "dual"
             thinking_token = reasoning_cfg.get("thinking_token", "<|thinking|>") if isinstance(reasoning_cfg, dict) else "<|thinking|>"
             start_token = reasoning_cfg.get("start_token", "<|start_of_thinking|>") if isinstance(reasoning_cfg, dict) else "<|start_of_thinking|>"
             end_token = reasoning_cfg.get("end_token", "<|end_of_thinking|>") if isinstance(reasoning_cfg, dict) else "<|end_of_thinking|>"
@@ -347,6 +348,7 @@ class LeRobotSingleDataset(Dataset):
                 spatial_wrist_token=spatial_wrist_token,
                 spatial_count=spatial_count,
                 spatial_query_mode=spatial_query_mode,
+                spatial_view_mode=spatial_view_mode,
                 thinking_token=thinking_token,
                 start_token=start_token,
                 end_token=end_token,

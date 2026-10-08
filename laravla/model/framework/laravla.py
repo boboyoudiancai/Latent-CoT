@@ -433,21 +433,34 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         spatial_loss_weight = float(spatial_cfg.get("loss_weight", 0.0) or 0.0)
         spatial_base_id = getattr(self.qwen_vl_interface, "spatial_base_token_id", None)
         spatial_wrist_id = getattr(self.qwen_vl_interface, "spatial_wrist_token_id", None)
+        spatial_view_mode = getattr(self.qwen_vl_interface, "spatial_view_mode", "dual")
         spatial_loss = None
+        base_mask = (
+            qwen_inputs["input_ids"] == int(spatial_base_id)
+            if spatial_base_id is not None
+            else None
+        )
+        wrist_mask = (
+            qwen_inputs["input_ids"] == int(spatial_wrist_id)
+            if spatial_wrist_id is not None
+            else None
+        )
         if (
             enable_spatial
             and bool(spatial_cfg.get("use_teacher", True))
             and spatial_loss_weight > 0
-            and spatial_base_id is not None
-            and spatial_wrist_id is not None
+            and (
+                spatial_base_id is not None
+                if spatial_view_mode == "base_only"
+                else spatial_base_id is not None and spatial_wrist_id is not None
+            )
         ):
-            base_mask = qwen_inputs["input_ids"] == int(spatial_base_id)
-            wrist_mask = qwen_inputs["input_ids"] == int(spatial_wrist_id)
             spatial_loss = self._compute_spatial_loss(
                 last_hidden=last_hidden,
                 target_images=batch_images,
                 base_mask=base_mask,
                 wrist_mask=wrist_mask,
+                view_mode=spatial_view_mode,
             )
 
         if self.training_stage == "reasoning_only":
@@ -596,29 +609,39 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         last_hidden: torch.Tensor,
         target_images: List,
         base_mask: torch.Tensor,
-        wrist_mask: torch.Tensor,
+        wrist_mask: Optional[torch.Tensor],
+        view_mode: str = "dual",
     ) -> Optional[torch.Tensor]:
-        """Align base/wrist special-token hidden states to pooled VGGT features."""
+        """Align spatial special-token hidden states to pooled VGGT features."""
         if last_hidden is None:
             raise ValueError("spatial supervision requires VLM hidden states")
         batch_size = last_hidden.shape[0]
         expected_count = int(getattr(self.qwen_vl_interface, "spatial_target_tokens", 16))
         base_counts = base_mask.sum(dim=1)
-        wrist_counts = wrist_mask.sum(dim=1)
-        if not torch.all(base_counts == expected_count) or not torch.all(
-            wrist_counts == expected_count
-        ):
-            raise ValueError(
-                "spatial token count mismatch: "
-                f"base={base_counts.detach().cpu().tolist()}, "
-                f"wrist={wrist_counts.detach().cpu().tolist()}, "
-                f"expected_per_sample={expected_count}"
-            )
-        base_count = expected_count
-        wrist_count = expected_count
-        pred_base = last_hidden[base_mask].view(batch_size, base_count, -1)
-        pred_wrist = last_hidden[wrist_mask].view(batch_size, wrist_count, -1)
-        pred = torch.stack([pred_base, pred_wrist], dim=1)
+        if view_mode == "base_only":
+            if not torch.all(base_counts == expected_count):
+                raise ValueError(
+                    "base-only spatial token count mismatch: "
+                    f"base={base_counts.detach().cpu().tolist()}, "
+                    f"expected={expected_count}"
+                )
+            pred = last_hidden[base_mask].view(batch_size, 1, expected_count, -1)
+        else:
+            if wrist_mask is None:
+                raise ValueError("dual-view spatial supervision requires a wrist mask")
+            wrist_counts = wrist_mask.sum(dim=1)
+            if not torch.all(base_counts == expected_count) or not torch.all(
+                wrist_counts == expected_count
+            ):
+                raise ValueError(
+                    "spatial token count mismatch: "
+                    f"base={base_counts.detach().cpu().tolist()}, "
+                    f"wrist={wrist_counts.detach().cpu().tolist()}, "
+                    f"expected_per_sample={expected_count}"
+                )
+            pred_base = last_hidden[base_mask].view(batch_size, expected_count, -1)
+            pred_wrist = last_hidden[wrist_mask].view(batch_size, expected_count, -1)
+            pred = torch.stack([pred_base, pred_wrist], dim=1)
         target = self.qwen_vl_interface.get_external_spatial_target(
             images=target_images,
             device=last_hidden.device,

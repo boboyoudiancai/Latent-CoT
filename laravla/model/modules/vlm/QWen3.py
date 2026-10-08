@@ -125,6 +125,9 @@ class _QWen3_VL_Interface(nn.Module):
         self.spatial_query_mode = str(bridge_cfg.get("spatial_query_mode", "legacy") or "legacy").strip().lower()
         if self.spatial_query_mode not in {"legacy", "visual_prefix_joint"}:
             raise ValueError(f"unsupported spatial_query_mode={self.spatial_query_mode!r}")
+        self.spatial_view_mode = str(spatial_cfg.get("view_mode", "dual") or "dual").strip().lower()
+        if self.spatial_view_mode not in {"dual", "base_only"}:
+            raise ValueError(f"unsupported spatial view_mode={self.spatial_view_mode!r}")
         self.spatial_use_teacher = bool(spatial_cfg.get("use_teacher", True)) if self.enable_spatial else False
         if self.enable_spatial:
             token_ids = self._add_spatial_tokens(self.processor.tokenizer, config)
@@ -249,6 +252,7 @@ class _QWen3_VL_Interface(nn.Module):
                 cache_size=int(spatial_cfg.get("target_cache_size", 0) or 0),
                 cache_dir=str(spatial_cfg.get("target_cache_dir", "") or ""),
                 cache_only=bool(spatial_cfg.get("target_cache_only", False)),
+                view_mode=self.spatial_view_mode,
             )
             target_dim = int(self.spatial_external_teacher.embed_dim)
         if not self.spatial_use_teacher:
@@ -628,7 +632,11 @@ class _QWen3_VL_Interface(nn.Module):
         allow = allow.unsqueeze(0) & valid.unsqueeze(2) & valid.unsqueeze(1)
 
         token_groups = [((getattr(self, "img_next_token_id", None),), 16)]
-        if self.spatial_query_mode == "visual_prefix_joint":
+        if self.spatial_view_mode == "base_only":
+            token_groups.append(
+                ((getattr(self, "spatial_base_token_id", None),), 16)
+            )
+        elif self.spatial_query_mode == "visual_prefix_joint":
             token_groups.append(
                 ((getattr(self, "spatial_base_token_id", None), getattr(self, "spatial_wrist_token_id", None)), 32)
             )

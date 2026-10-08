@@ -22,6 +22,7 @@ class BridgeReasoningFormatter:
     spatial_wrist_token: str = "<spatial_wrist>"
     spatial_count: int = 16
     spatial_query_mode: str = "legacy"
+    spatial_view_mode: str = "dual"
     thinking_token: str = "<|thinking|>"
     start_token: str = "<|start_of_thinking|>"
     end_token: str = "<|end_of_thinking|>"
@@ -46,6 +47,12 @@ class BridgeReasoningFormatter:
             raise ValueError(
                 "spatial_query_mode must be 'legacy' or 'visual_prefix_joint', "
                 f"got {self.spatial_query_mode!r}"
+            )
+        self.spatial_view_mode = str(self.spatial_view_mode or "dual").strip().lower()
+        if self.spatial_view_mode not in {"dual", "base_only"}:
+            raise ValueError(
+                "spatial_view_mode must be 'dual' or 'base_only', "
+                f"got {self.spatial_view_mode!r}"
             )
 
     def _bbox_to_str(self, bbox: np.ndarray, confidence: float) -> str:
@@ -257,6 +264,8 @@ class BridgeReasoningFormatter:
         if not self.include_spatial or self.spatial_count <= 0:
             return ""
         base = "".join([self.spatial_base_token] * self.spatial_count)
+        if self.spatial_view_mode == "base_only":
+            return base
         wrist = "".join([self.spatial_wrist_token] * self.spatial_count)
         return f"{base}{wrist}"
 

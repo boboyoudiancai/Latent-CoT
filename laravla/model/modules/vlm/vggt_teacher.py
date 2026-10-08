@@ -226,6 +226,7 @@ class VGGTTeacher:
         cache_size: int = 0,
         cache_dir: str = "",
         cache_only: bool = False,
+        view_mode: str = "dual",
     ) -> None:
         if not teacher_repo:
             raise ValueError("framework.spatial.teacher_repo must point to a local VGGT repository")
@@ -235,6 +236,9 @@ class VGGTTeacher:
         self.patch_start_idx = int(patch_start_idx)
         self.use_vggt_pe = bool(use_vggt_pe)
         self.preprocess_mode = str(preprocess_mode)
+        self.view_mode = str(view_mode or "dual").strip().lower()
+        if self.view_mode not in {"dual", "base_only"}:
+            raise ValueError(f"unsupported VGGT view_mode={self.view_mode!r}")
         self.cache_size = max(0, int(cache_size))
         self._feature_cache = OrderedDict()
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
@@ -328,11 +332,18 @@ class VGGTTeacher:
         rows = []
         for sample in images:
             views = list(sample) if isinstance(sample, (list, tuple)) else [sample]
-            if len(views) < 2:
+            required_views = 1 if self.view_mode == "base_only" else 2
+            if len(views) < required_views:
                 raise ValueError(
-                    "VGGT spatial alignment requires two views per sample: base and wrist"
+                    "VGGT spatial alignment requires "
+                    f"{required_views} view(s) per sample for view_mode={self.view_mode}"
                 )
-            rows.append(torch.stack([self.transform(self._as_rgb(view)) for view in views[:2]], dim=0))
+            rows.append(
+                torch.stack(
+                    [self.transform(self._as_rgb(view)) for view in views[:required_views]],
+                    dim=0,
+                )
+            )
         return torch.stack(rows, dim=0).to(device=device, dtype=torch.float32)
 
     def _unwrap_features(self, output: Any, images: torch.Tensor):
@@ -356,7 +367,8 @@ class VGGTTeacher:
             digest.update(str(cache_key).encode("utf-8"))
             return digest.digest()
         views = list(sample) if isinstance(sample, (list, tuple)) else [sample]
-        for view in views[:2]:
+        required_views = 1 if self.view_mode == "base_only" else 2
+        for view in views[:required_views]:
             image = self._as_rgb(view)
             digest.update(str(image.size).encode("ascii"))
             digest.update(image.tobytes())
