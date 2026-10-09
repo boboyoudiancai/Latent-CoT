@@ -146,6 +146,11 @@ class M1Inference:
         self._spatial_wrist_token = str(
             bridge_cfg.get("spatial_wrist_token", spatial_cfg.get("wrist_token", "<spatial_wrist>"))
         )
+        self._spatial_view_mode = str(
+            bridge_cfg.get("spatial_view_mode", spatial_cfg.get("view_mode", "dual")) or "dual"
+        ).strip().lower()
+        if self._spatial_view_mode not in {"dual", "base_only"}:
+            raise ValueError(f"Unsupported spatial_view_mode={self._spatial_view_mode!r}")
         self._spatial_query_mode = str(bridge_cfg.get("spatial_query_mode", "legacy") or "legacy").strip().lower()
         if self._spatial_query_mode not in {"legacy", "visual_prefix_joint"}:
             raise ValueError(f"Unsupported spatial_query_mode={self._spatial_query_mode!r}")
@@ -215,6 +220,8 @@ class M1Inference:
         if (not self._include_spatial) or self._spatial_count <= 0:
             return ""
         base = self._spatial_base_token * self._spatial_count
+        if self._spatial_view_mode == "base_only":
+            return base
         wrist = self._spatial_wrist_token * self._spatial_count
         return base + wrist
 
@@ -253,9 +260,10 @@ class M1Inference:
             and self._include_spatial
         ):
             spatial_span = self._spatial_span()
+            language_text = f"{prompt}."
             if self._spatial_query_mode == "visual_prefix_joint":
-                return f"{spatial_span} {prompt}".strip()
-            return f"{prompt} {spatial_span}".strip()
+                return f"{spatial_span} {language_text}".strip()
+            return f"{language_text} {spatial_span}".strip()
         else:
             return prompt
 

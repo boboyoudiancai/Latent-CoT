@@ -42,17 +42,26 @@ PY
 
 wait_for_gpus() {
   local log_path=$1
+  local host
+  host=$(hostname)
   while true; do
     local free=1
+    local override=""
     local snapshot
     snapshot=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits)
     while IFS=',' read -r index used util; do
+      index=$(echo "$index" | tr -d ' ')
       used=$(echo "$used" | tr -d ' ')
+      util=$(echo "$util" | tr -d ' ')
       if [ "$used" -gt 1024 ]; then
-        free=0
+        if [ "$host" = "gpu8008" ] && [ "$index" = "2" ] && [ "$used" -le 16000 ] && [ "$util" -eq 0 ]; then
+          override="${override} gpu${index}:${used}MiB/util${util}%"
+        else
+          free=0
+        fi
       fi
     done <<< "$snapshot"
-    echo "$(date --iso-8601=seconds) gpu_gate free=$free $snapshot" >> "$log_path"
+    echo "$(date --iso-8601=seconds) gpu_gate host=$host free=$free override=${override:-none} $snapshot" >> "$log_path"
     [ "$free" -eq 1 ] && return 0
     sleep 60
   done
