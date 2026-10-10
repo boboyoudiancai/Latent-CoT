@@ -5,7 +5,7 @@ REPO=/share/home/u25505/apps/wangbo/LatentVLA/LaRA-VLA
 TEXT_ROOT=$REPO/playground/Checkpoints/Text2Latent
 EVAL_PY=/share/home/u25505/apps/wangbo/LatentVLA/env/liberoplus/bin/python
 SERVER_PY=/share/home/u25505/apps/wangbo/LatentVLA/env/starvla/bin/python
-RESULT_ROOT=/share/home/u25505/apps/wangbo/LatentVLA/results/libero-plus/spatial_baseonly16_noaux_25k30k_l40_20261010
+RESULT_ROOT=/share/home/u25505/apps/wangbo/LatentVLA/results/libero-plus/spatial_baseonly16_noaux_25k30k_l40_20261010_retry2
 RUN_ROOT=$TEXT_ROOT/Text2Latent_action_from_spatial_baseonly16_noaux_stage2_40k_gpu8008_20261008
 
 export LIBERO_HOME=$REPO/LIBERO-plus
@@ -53,7 +53,7 @@ run_suite() {
   mkdir -p $out/server_logs
   echo "$(date --iso-8601=seconds) start label=$label suite=$suite ckpt=$ckpt gpus=$server_gpus ports=$ports" >> $out/launcher.log
   set +e
-  $EVAL_PY $REPO/examples/LIBERO-plus/eval_files/eval_lara_plus.py +    --pretrained-path $ckpt +    --host 127.0.0.1 --hosts $hosts --port $port --ports $ports +    --task-suite-name $suite --num-trials-per-task 1 +    --log-path $out --video-out-path $out --seed 7 +    --cot-mode none --thinking-token-count 0 --img-next-count 0 +    --launch-servers --server-gpus $server_gpus --num-processes 8 +    --render-gpu-ids $render_gpu --server-python $SERVER_PY +    --server-log-path $out/server_logs --server-timeout 1800 +    > $out/eval.log 2>&1
+  $EVAL_PY $REPO/examples/LIBERO-plus/eval_files/eval_lara_plus.py --pretrained-path $ckpt --host 127.0.0.1 --hosts $hosts --port $port --ports $ports --task-suite-name $suite --num-trials-per-task 1 --log-path $out --video-out-path $out --seed 7 --cot-mode none --thinking-token-count 0 --img-next-count 0 --launch-servers --server-gpus $server_gpus --num-processes 8 --render-gpu-ids $render_gpu --server-python $SERVER_PY --server-log-path $out/server_logs --server-timeout 1800 > $out/eval.log 2>&1
   local rc=$?
   set -e
   echo $rc > $out/eval.exitcode
