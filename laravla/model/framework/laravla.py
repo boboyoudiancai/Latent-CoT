@@ -652,8 +652,14 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             raise ValueError(
                 f"VGGT spatial shape mismatch: prediction={tuple(pred.shape)} target={tuple(target.shape)}"
             )
-        cosine = F.cosine_similarity(pred.float(), target.float(), dim=-1)
-        return (1.0 - cosine).mean()
+        spatial_cfg = getattr(self.config.framework, "spatial", {})
+        loss_type = str(spatial_cfg.get("loss_type", "cosine")).strip().lower()
+        if loss_type == "l2":
+            return F.mse_loss(pred.float(), target.float())
+        elif loss_type == "cosine":
+            cosine = F.cosine_similarity(pred.float(), target.float(), dim=-1)
+            return (1.0 - cosine).mean()
+        raise ValueError(f"unsupported spatial loss_type={loss_type!r}")
 
     def _compute_img_next_loss(
         self,
