@@ -242,6 +242,9 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 def validate_ecot_config(cfg):
     """Validate latent reasoning configuration consistency."""
+    from laravla.model.modules.vlm.spatial_cross_attention import validate_spatial_only_config
+
+    validate_spatial_only_config(cfg)
     latent_cfg = cfg.framework.get("latent_reasoning", {})
     if not latent_cfg:
         logger.warning("latent_reasoning config is missing, using defaults")
@@ -865,6 +868,8 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     accelerator.wait_for_everyone()
     # build model
+    if training_stage == "spatial_only":
+        set_seed(cfg.seed + accelerator.process_index)
     vla = build_framework(cfg)
     attach_auxiliary_latent_decoder(vla, cfg, accelerator.device)
     # prepare data

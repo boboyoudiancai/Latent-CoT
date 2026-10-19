@@ -227,12 +227,14 @@ class VGGTTeacher:
         cache_dir: str = "",
         cache_only: bool = False,
         view_mode: str = "dual",
+        expected_patch_tokens: int = None,
     ) -> None:
         if not teacher_repo:
             raise ValueError("framework.spatial.teacher_repo must point to a local VGGT repository")
         self.teacher_repo = str(teacher_repo)
         self.input_size = int(input_size)
         self.layer = int(layer)
+        self.expected_patch_tokens = expected_patch_tokens
         self.patch_start_idx = int(patch_start_idx)
         self.use_vggt_pe = bool(use_vggt_pe)
         self.preprocess_mode = str(preprocess_mode)
@@ -452,6 +454,12 @@ class VGGTTeacher:
         if features.ndim != 4:
             raise ValueError(f"unsupported VGGT feature shape {tuple(features.shape)}")
         features = features[..., int(patch_start_idx):, :]
+        if self.expected_patch_tokens is not None:
+            if features.shape[-2] != self.expected_patch_tokens or int(target_tokens) != self.expected_patch_tokens:
+                raise ValueError(
+                    f"full-resolution VGGT alignment requires {self.expected_patch_tokens} patches, "
+                    f"got features={features.shape[-2]}, target_tokens={target_tokens}"
+                )
         return pool_vggt_tokens(features, int(target_tokens), self.use_vggt_pe).detach()
 
     @torch.no_grad()

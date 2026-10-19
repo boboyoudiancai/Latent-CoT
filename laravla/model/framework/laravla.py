@@ -19,6 +19,7 @@ from PIL import Image
 
 
 from laravla.training.trainer_utils import initialize_overwatch
+from laravla.model.modules.vlm.spatial_cross_attention import dense_spatial_cosine_loss, validate_spatial_only_config
 
 logger = initialize_overwatch(__name__)
 
@@ -67,6 +68,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         """
         super().__init__()
         self.config = config
+        validate_spatial_only_config(config)
         raw_include_state = config.datasets.vla_data.get("include_state", False)
         include_state = (
             raw_include_state.strip().lower() in {"1", "true", "yes", "on"}
@@ -92,7 +94,12 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         self.training_stage = config.framework.get("training_stage", "full")
 
         # Apply parameter freezing based on training stage
-        if self.training_stage == "reasoning_only":
+        if self.training_stage == "spatial_only":
+            self.requires_grad_(True)
+            self.qwen_vl_interface.spatial_external_teacher.encoder.requires_grad_(False)
+            self.qwen_vl_interface.spatial_external_teacher.encoder.eval()
+            print("[Training Stage] spatial_only - Only VGGT frozen; no CE or action loss")
+        elif self.training_stage == "reasoning_only":
             print(f"[Training Stage] reasoning_only mode - Freezing action_model parameters")
             for param in self.action_model.parameters():
                 param.requires_grad = False
@@ -279,6 +286,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         """
 
         """
+        if self.training_stage == "spatial_only":
+            return self._forward_spatial_only(examples)
         batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
         instructions = [example["lang"] for example in examples]  # [B, str]
         actions = [example["action"] for example in examples]  # label [B， len, 7]
@@ -455,13 +464,16 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 else spatial_base_id is not None and spatial_wrist_id is not None
             )
         ):
-            spatial_loss = self._compute_spatial_loss(
-                last_hidden=last_hidden,
-                target_images=batch_images,
-                base_mask=base_mask,
-                wrist_mask=wrist_mask,
-                view_mode=spatial_view_mode,
-            )
+            if spatial_cfg.get("alignment_mode") == "cross_attention":
+                spatial_loss = self._compute_dense_spatial_loss(last_hidden, qwen_inputs, batch_images)
+            else:
+                spatial_loss = self._compute_spatial_loss(
+                    last_hidden=last_hidden,
+                    target_images=batch_images,
+                    base_mask=base_mask,
+                    wrist_mask=wrist_mask,
+                    view_mode=spatial_view_mode,
+                )
 
         if self.training_stage == "reasoning_only":
             # Stage 1: Only train VLM reasoning, skip action head
@@ -603,6 +615,30 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             )
 
         return result
+
+    def _forward_spatial_only(self, examples) -> dict:
+        if not examples:
+            raise ValueError("spatial-only forward requires a nonempty image/language batch")
+        images = [example["image"] for example in examples]
+        if any(not isinstance(sample, (list, tuple)) or len(sample) != 2 for sample in images):
+            raise ValueError("spatial-only Stage1 requires exactly base+wrist images per sample")
+        inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=images,
+            instructions=[example["lang"] for example in examples],
+            solutions=None,
+        )
+        inputs.pop("labels", None)
+        last_hidden = self.qwen_vl_interface.forward_spatial_features(**inputs)
+        spatial_loss = self._compute_dense_spatial_loss(last_hidden, inputs, images)
+        loss_weight = float(self.config.framework.spatial.get("loss_weight", 0.1))
+        return {"spatial_loss": spatial_loss, "total_loss": loss_weight * spatial_loss}
+
+    def _compute_dense_spatial_loss(self, last_hidden, inputs, images) -> torch.Tensor:
+        prediction = self.qwen_vl_interface.reconstruct_spatial_features(
+            last_hidden, inputs, image_counts=[len(sample) for sample in images]
+        )
+        target = self.qwen_vl_interface.get_dense_spatial_target(images, last_hidden.device)
+        return dense_spatial_cosine_loss(prediction, target)
 
     def _compute_spatial_loss(
         self,

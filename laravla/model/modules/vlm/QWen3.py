@@ -12,6 +12,12 @@ from torch.nn.utils.rnn import pad_sequence
 
 from laravla.training.trainer_utils import initialize_overwatch
 from .vggt_teacher import AlignProjector, VGGTTeacher
+from .spatial_cross_attention import (
+    SpatialCrossAttentionDecoder,
+    select_base_visual_queries,
+    select_spatial_hidden,
+    validate_spatial_only_config,
+)
 
 logger = initialize_overwatch(__name__)
 BASE_PROMPT = (
@@ -239,6 +245,9 @@ class _QWen3_VL_Interface(nn.Module):
         return ids
 
     def _init_spatial_vggt_teacher(self, spatial_cfg) -> None:
+        if spatial_cfg.get("alignment_mode") == "cross_attention":
+            self._init_spatial_cross_attention(spatial_cfg)
+            return
         target_dim = int(spatial_cfg.get("target_dim", self.spatial_target_dim))
         if self.spatial_use_teacher:
             repo = str(spatial_cfg.get("teacher_repo", "") or "").strip()
@@ -277,6 +286,69 @@ class _QWen3_VL_Interface(nn.Module):
             target_dim,
             self.spatial_target_tokens,
         )
+
+    def _init_spatial_cross_attention(self, spatial_cfg) -> None:
+        validate_spatial_only_config(self.config)
+        input_size = int(spatial_cfg.get("input_size", 518))
+        self.spatial_teacher_target_tokens = (input_size // 14) ** 2
+        with torch.random.fork_rng(devices=[]):
+            self.spatial_external_teacher = VGGTTeacher(
+                teacher_repo=str(spatial_cfg.get("teacher_repo", "")),
+                input_size=input_size,
+                layer=int(spatial_cfg.get("teacher_layer", -1)),
+                patch_start_idx=int(spatial_cfg.get("patch_start_idx", 5)),
+                use_vggt_pe=bool(spatial_cfg.get("use_vggt_pe", True)),
+                preprocess_mode="resize",
+                view_mode="base_only",
+                expected_patch_tokens=self.spatial_teacher_target_tokens,
+            )
+        self.spatial_target_dim = int(self.spatial_external_teacher.embed_dim)
+        self.spatial_cross_attention_decoder = SpatialCrossAttentionDecoder(
+            hidden_size=int(self.model.config.text_config.hidden_size),
+            target_dim=self.spatial_target_dim,
+            attention_dim=int(spatial_cfg.get("cross_attention_dim", 512)),
+            num_heads=int(spatial_cfg.get("cross_attention_heads", 8)),
+        )
+        logger.info(
+            "[spatial_cross_attention] visual Q -> %d dense patches, 16 spatial K/V, target_dim=%d",
+            self.spatial_teacher_target_tokens,
+            self.spatial_target_dim,
+        )
+
+    def reconstruct_spatial_features(self, last_hidden, qwen_inputs, image_counts) -> torch.Tensor:
+        image_token_id = int(self.model.config.image_token_id)
+        spatial_hidden = select_spatial_hidden(
+            last_hidden,
+            qwen_inputs["input_ids"],
+            qwen_inputs["attention_mask"],
+            self.spatial_base_token_id,
+            self.spatial_wrist_token_id,
+            image_token_id,
+            self.spatial_target_tokens,
+        )
+        visual_queries = select_base_visual_queries(
+            last_hidden,
+            qwen_inputs["input_ids"],
+            qwen_inputs["attention_mask"],
+            qwen_inputs["image_grid_thw"],
+            image_token_id,
+            int(self.model.config.vision_config.spatial_merge_size),
+            int(self.spatial_teacher_target_tokens**0.5),
+            image_counts,
+        )
+        with torch.autocast(device_type=last_hidden.device.type, dtype=torch.bfloat16, enabled=last_hidden.device.type == "cuda"):
+            return self.spatial_cross_attention_decoder(visual_queries, spatial_hidden)
+
+    def get_dense_spatial_target(self, images, device) -> torch.Tensor:
+        target = self.spatial_external_teacher.encode(
+            images=images,
+            device=device,
+            target_tokens=self.spatial_teacher_target_tokens,
+        )
+        expected_shape = (len(images), 1, self.spatial_teacher_target_tokens, self.spatial_target_dim)
+        if tuple(target.shape) != expected_shape:
+            raise ValueError(f"dense VGGT target shape mismatch: {tuple(target.shape)} vs {expected_shape}")
+        return target[:, 0].detach()
 
     def project_spatial_prediction(self, prediction: torch.Tensor) -> torch.Tensor:
         projector = getattr(self, "spatial_align_projector", None)
@@ -601,6 +673,19 @@ class _QWen3_VL_Interface(nn.Module):
             )
 
         return outputs
+
+    def forward_spatial_features(self, **kwargs) -> torch.Tensor:
+        if kwargs.pop("labels", None) is not None:
+            raise ValueError("spatial-only forward must not receive CE labels")
+        input_ids = kwargs.get("input_ids")
+        attention_mask = kwargs.get("attention_mask")
+        if not isinstance(input_ids, torch.Tensor) or not isinstance(attention_mask, torch.Tensor):
+            raise ValueError("spatial-only forward requires input_ids and a padding mask")
+        if not self._should_enable_img_next_full_attention():
+            raise ValueError("spatial-only visual-prefix attention requires SDPA")
+        kwargs.update(output_hidden_states=True, output_attentions=False, return_dict=True)
+        outputs = self(**kwargs)
+        return outputs.hidden_states[-1]
 
     def _should_enable_img_next_full_attention(self) -> bool:
         """
