@@ -20,6 +20,12 @@ from PIL import Image
 
 from laravla.training.trainer_utils import initialize_overwatch
 from laravla.model.modules.vlm.spatial_cross_attention import dense_spatial_cosine_loss, validate_spatial_only_config
+from laravla.model.modules.vlm.spatial_forcing_aux import (
+    SpatialForcingAlignProjector,
+    select_base_image_hidden,
+    spatial_forcing_cosine_loss,
+)
+from laravla.model.modules.vlm.vggt_teacher import VGGTTeacher
 
 logger = initialize_overwatch(__name__)
 
@@ -83,6 +89,9 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
 
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)  # 修复后续引用
+        self.training_stage = config.framework.get("training_stage", "full")
+        self._init_action_vggt_condition(config)
+        self._init_spatial_forcing_aux(config)
         self._fast_action_processor = None
         self._fast_action_token_range = None
 
@@ -91,8 +100,6 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         self.chunk_len = self.past_action_window_size + 1 + self.future_action_window_size
         
         # Training stage control: "reasoning_only", "action_only", or "full"
-        self.training_stage = config.framework.get("training_stage", "full")
-
         # Apply parameter freezing based on training stage
         if self.training_stage == "spatial_only":
             self.requires_grad_(True)
@@ -109,6 +116,200 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 param.requires_grad = False
         else:
             print(f"[Training Stage] full mode - All parameters trainable")
+
+    def _init_action_vggt_condition(self, config) -> None:
+        action_vggt_cfg = getattr(config.framework, "action_vggt_condition", {})
+        self.action_vggt_enabled = bool(action_vggt_cfg.get("enable", False))
+        self.action_vggt_teacher = None
+        self.action_vggt_projector = None
+        self.action_vggt_token_count = 0
+        self._action_vggt_shape_logged = False
+        if not self.action_vggt_enabled:
+            return
+        if self.training_stage not in {"action_only", "full"}:
+            raise ValueError("action_vggt_condition requires training_stage='action_only' or 'full'")
+        spatial_cfg = getattr(config.framework, "spatial", {})
+        bridge_cfg = getattr(config.datasets.vla_data, "bridge_reasoning", {})
+        if bool(spatial_cfg.get("enable", False)) or bool(bridge_cfg.get("include_spatial", False)):
+            raise ValueError("action_vggt_condition is an upper-bound baseline without spatial latent tokens")
+        input_size = int(action_vggt_cfg.get("input_size", 518))
+        if input_size <= 0 or input_size % 14:
+            raise ValueError("action_vggt_condition.input_size must be a positive multiple of 14")
+        expected_patch_tokens = (input_size // 14) ** 2
+        token_count = int(action_vggt_cfg.get("token_count", expected_patch_tokens))
+        if token_count != expected_patch_tokens:
+            raise ValueError(
+                "action_vggt_condition must keep every VGGT patch token: "
+                f"expected {expected_patch_tokens}, got {token_count}"
+            )
+        if bool(action_vggt_cfg.get("use_vggt_pe", False)):
+            raise ValueError("action_vggt_condition must use the original VGGT patch tokens without extra PE")
+        with torch.random.fork_rng(devices=[]):
+            teacher = VGGTTeacher(
+                teacher_repo=str(action_vggt_cfg.get("teacher_repo", "")),
+                input_size=input_size,
+                layer=int(action_vggt_cfg.get("teacher_layer", -1)),
+                patch_start_idx=int(action_vggt_cfg.get("patch_start_idx", 5)),
+                use_vggt_pe=bool(action_vggt_cfg.get("use_vggt_pe", False)),
+                preprocess_mode=str(action_vggt_cfg.get("preprocess_mode", "resize")),
+                cache_size=int(action_vggt_cfg.get("target_cache_size", 0) or 0),
+                cache_dir=str(action_vggt_cfg.get("target_cache_dir", "") or ""),
+                cache_only=bool(action_vggt_cfg.get("target_cache_only", False)),
+                view_mode="base_only",
+                expected_patch_tokens=expected_patch_tokens,
+            )
+        hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
+        projector = torch.nn.Linear(int(teacher.embed_dim), hidden_size, bias=False)
+        torch.nn.init.xavier_uniform_(projector.weight)
+        self.action_vggt_teacher = teacher
+        self.action_vggt_projector = projector
+        self.action_vggt_token_count = token_count
+        logger.info(
+            "[action_vggt_condition] appending all %d VGGT patch tokens to action conditioning",
+            token_count,
+        )
+
+    def _append_action_vggt_condition(
+        self,
+        hidden: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        images: List,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not getattr(self, "action_vggt_enabled", False):
+            return hidden, attention_mask
+        teacher = getattr(self, "action_vggt_teacher", None)
+        projector = getattr(self, "action_vggt_projector", None)
+        if teacher is None or projector is None:
+            raise RuntimeError("action VGGT condition is enabled but its teacher/projector is unavailable")
+        features = teacher.encode(
+            images=images,
+            device=hidden.device,
+            target_tokens=self.action_vggt_token_count,
+        )
+        expected = (
+            hidden.shape[0],
+            1,
+            self.action_vggt_token_count,
+            int(teacher.embed_dim),
+        )
+        if tuple(features.shape) != expected:
+            raise ValueError(f"action VGGT feature shape mismatch: {tuple(features.shape)} vs {expected}")
+        features = features[:, 0].detach()
+        with torch.autocast(
+            device_type=hidden.device.type,
+            dtype=torch.bfloat16,
+            enabled=hidden.device.type == "cuda",
+        ):
+            projected = projector(features)
+        projected = projected.to(dtype=hidden.dtype)
+        if projected.shape[-1] != hidden.shape[-1]:
+            raise ValueError("projected VGGT tokens must match the Qwen hidden dimension")
+        if attention_mask is None:
+            attention_mask = torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
+        else:
+            attention_mask = attention_mask.to(device=hidden.device, dtype=torch.bool)
+        vggt_mask = torch.ones(projected.shape[:2], dtype=torch.bool, device=hidden.device)
+        combined = torch.cat([hidden, projected], dim=1)
+        combined_mask = torch.cat([attention_mask, vggt_mask], dim=1)
+        if not getattr(self, "_action_vggt_shape_logged", False):
+            logger.info(
+                "[action_vggt_condition] qwen_tokens=%d vggt_tokens=%d combined_tokens=%d",
+                hidden.shape[1],
+                projected.shape[1],
+                combined.shape[1],
+            )
+            self._action_vggt_shape_logged = True
+        return combined, combined_mask
+
+    def _init_spatial_forcing_aux(self, config) -> None:
+        forcing_cfg = getattr(config.framework, "spatial_forcing_aux", {})
+        self.spatial_forcing_enabled = bool(forcing_cfg.get("enable", False))
+        self.spatial_forcing_teacher = None
+        self.spatial_forcing_projector = None
+        self.spatial_forcing_student_layer = 0
+        self.spatial_forcing_target_tokens = 0
+        self.spatial_forcing_loss_weight = 0.0
+        if not self.spatial_forcing_enabled:
+            return
+        if self.action_vggt_enabled:
+            raise ValueError("spatial_forcing_aux and action_vggt_condition are mutually exclusive")
+        if self.training_stage != "full":
+            raise ValueError("spatial_forcing_aux requires training_stage='full'")
+        input_size = int(forcing_cfg.get("input_size", 518))
+        with torch.random.fork_rng(devices=[]):
+            teacher = VGGTTeacher(
+                teacher_repo=str(forcing_cfg.get("teacher_repo", "")),
+                input_size=input_size,
+                layer=int(forcing_cfg.get("teacher_layer", -1)),
+                patch_start_idx=int(forcing_cfg.get("patch_start_idx", 5)),
+                use_vggt_pe=bool(forcing_cfg.get("use_vggt_pe", True)),
+                preprocess_mode=str(forcing_cfg.get("preprocess_mode", "resize")),
+                cache_size=int(forcing_cfg.get("target_cache_size", 0) or 0),
+                cache_dir=str(forcing_cfg.get("target_cache_dir", "") or ""),
+                cache_only=bool(forcing_cfg.get("target_cache_only", False)),
+                view_mode="base_only",
+            )
+        hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
+        self.spatial_forcing_teacher = teacher
+        self.spatial_forcing_projector = SpatialForcingAlignProjector(
+            input_dim=hidden_size,
+            target_dim=int(teacher.embed_dim),
+            use_vlm_norm=bool(forcing_cfg.get("use_vlm_norm", True)),
+        )
+        self.spatial_forcing_student_layer = int(forcing_cfg.get("student_layer", 24))
+        self.spatial_forcing_target_tokens = int(forcing_cfg.get("target_tokens", 49))
+        self.spatial_forcing_loss_weight = float(forcing_cfg.get("loss_weight", 0.5))
+        logger.info(
+            "[spatial_forcing_aux] qwen_layer=%d base_tokens=%d target_dim=%d weight=%.3f",
+            self.spatial_forcing_student_layer,
+            self.spatial_forcing_target_tokens,
+            int(teacher.embed_dim),
+            self.spatial_forcing_loss_weight,
+        )
+
+    def _compute_spatial_forcing_aux_loss(
+        self,
+        student_hidden: torch.Tensor,
+        qwen_inputs: dict,
+        images: List,
+    ) -> torch.Tensor:
+        vision_hidden = select_base_image_hidden(
+            hidden=student_hidden,
+            input_ids=qwen_inputs["input_ids"],
+            attention_mask=qwen_inputs["attention_mask"],
+            image_grid_thw=qwen_inputs["image_grid_thw"],
+            image_token_id=int(self.qwen_vl_interface.model.config.image_token_id),
+            spatial_merge_size=int(self.qwen_vl_interface.model.config.vision_config.spatial_merge_size),
+            image_counts=[len(sample) if isinstance(sample, (list, tuple)) else 1 for sample in images],
+        )
+        if vision_hidden.shape[1] != self.spatial_forcing_target_tokens:
+            raise ValueError(
+                f"Spatial Forcing expected {self.spatial_forcing_target_tokens} base-image tokens, "
+                f"got {vision_hidden.shape[1]}"
+            )
+        target = self.spatial_forcing_teacher.encode(
+            images=images,
+            device=student_hidden.device,
+            target_tokens=vision_hidden.shape[1],
+        )
+        expected = (
+            student_hidden.shape[0],
+            1,
+            vision_hidden.shape[1],
+            int(self.spatial_forcing_teacher.embed_dim),
+        )
+        if tuple(target.shape) != expected:
+            raise ValueError(f"Spatial Forcing VGGT target shape mismatch: {tuple(target.shape)} vs {expected}")
+        with torch.autocast(
+            device_type=student_hidden.device.type,
+            dtype=torch.bfloat16,
+            enabled=student_hidden.device.type == "cuda",
+        ):
+            return spatial_forcing_cosine_loss(
+                self.spatial_forcing_projector,
+                vision_hidden,
+                target[:, 0],
+            )
 
     def attach_latent_decoder(
         self,
@@ -327,6 +528,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             solutions=cot_solutions,
             action_tokens=action_tokens,
         )
+        if self.action_vggt_enabled or self.spatial_forcing_enabled:
+            qwen_inputs.pop("labels", None)
         if use_generated_cot:
             qwen_inputs.pop("labels", None)
         # Check if iterative implicit reasoning is enabled
@@ -337,6 +540,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         )
 
         if use_iterative_forward:
+            if self.spatial_forcing_enabled:
+                raise ValueError("spatial_forcing_aux requires the normal Qwen forward with hidden-state layers")
             # Step 2: Iterative forward with KV-Cache for implicit reasoning
             vlm_outputs = self.qwen_vl_interface.forward_latent(
                 input_ids=qwen_inputs["input_ids"],
@@ -360,6 +565,11 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     return_dict=True,
                 )
                 last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
+                spatial_forcing_hidden = (
+                    qwenvl_outputs.hidden_states[self.spatial_forcing_student_layer]
+                    if self.spatial_forcing_enabled
+                    else None
+                )
                 vlm_loss = qwenvl_outputs.loss if hasattr(qwenvl_outputs, 'loss') else None
 
         latent_decoder_loss = None
@@ -391,8 +601,22 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 max_tokens=action_context_max_tokens,
             )
 
+        action_condition_hidden, action_condition_mask = self._append_action_vggt_condition(
+            hidden=last_hidden,
+            attention_mask=backbone_attention_mask,
+            images=batch_images,
+        )
+
         # Step 3: Compute losses based on training stage
         result = {}
+
+        spatial_forcing_loss = None
+        if self.spatial_forcing_enabled:
+            spatial_forcing_loss = self._compute_spatial_forcing_aux_loss(
+                spatial_forcing_hidden,
+                qwen_inputs,
+                batch_images,
+            )
 
         img_next_loss = None
         img_next_cfg = getattr(self.config.framework, "img_next", {}) if hasattr(self.config, "framework") else {}
@@ -518,10 +742,10 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
                 )
                 actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-                last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+                last_hidden_repeated = action_condition_hidden.repeat(repeated_diffusion_steps, 1, 1)
                 action_attention_mask = (
-                    backbone_attention_mask.repeat(repeated_diffusion_steps, 1)
-                    if backbone_attention_mask is not None
+                    action_condition_mask.repeat(repeated_diffusion_steps, 1)
+                    if action_condition_mask is not None
                     else None
                 )
                 
@@ -561,10 +785,10 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     self.config.trainer.get("repeated_diffusion_steps", 4) if self.config and self.config.trainer else 4
                 )
                 actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-                last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
+                last_hidden_repeated = action_condition_hidden.repeat(repeated_diffusion_steps, 1, 1)
                 action_attention_mask = (
-                    backbone_attention_mask.repeat(repeated_diffusion_steps, 1)
-                    if backbone_attention_mask is not None
+                    action_condition_mask.repeat(repeated_diffusion_steps, 1)
+                    if action_condition_mask is not None
                     else None
                 )
                 
@@ -607,6 +831,11 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         if spatial_loss is not None:
             result["spatial_loss"] = spatial_loss
             result["total_loss"] = result["total_loss"] + spatial_loss_weight * spatial_loss
+        if spatial_forcing_loss is not None:
+            result["spatial_forcing_loss"] = spatial_forcing_loss
+            result["total_loss"] = (
+                result["total_loss"] + self.spatial_forcing_loss_weight * spatial_forcing_loss
+            )
         if latent_decoder_loss is not None:
             result["decoder_loss"] = latent_decoder_loss
             result["total_loss"] = (
@@ -1169,6 +1398,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             batch_images = resize_images(batch_images, target_size=train_obs_image_size)
 
         if bool(kwargs.get("use_fast_action_tokens", False)):
+            if self.action_vggt_enabled:
+                raise ValueError("fast action-token inference bypasses action_vggt_condition")
             return self._predict_action_fast(batch_images=batch_images, instructions=instructions, **kwargs)
     
         use_iterative_forward = bool(kwargs.get("use_iterative_forward", False)) and hasattr(
@@ -1224,13 +1455,19 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 )
                 last_hidden = qwenvl_outputs.hidden_states[-1]   # [B, L, H]
 
+        action_condition_hidden, action_condition_mask = self._append_action_vggt_condition(
+            hidden=last_hidden,
+            attention_mask=backbone_attention_mask,
+            images=batch_images,
+        )
+
         state = torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype) if state is not None else None
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             pred_actions = self.action_model.predict_action(
-                last_hidden,
+                action_condition_hidden,
                 state,
-                encoder_attention_mask=backbone_attention_mask,
+                encoder_attention_mask=action_condition_mask,
             )  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()

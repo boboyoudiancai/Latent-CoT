@@ -460,6 +460,8 @@ class VGGTTeacher:
                     f"full-resolution VGGT alignment requires {self.expected_patch_tokens} patches, "
                     f"got features={features.shape[-2]}, target_tokens={target_tokens}"
                 )
+            if not self.use_vggt_pe:
+                return features.detach()
         return pool_vggt_tokens(features, int(target_tokens), self.use_vggt_pe).detach()
 
     @torch.no_grad()

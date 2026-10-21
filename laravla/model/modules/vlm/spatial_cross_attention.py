@@ -10,10 +10,72 @@ def validate_spatial_only_config(config) -> None:
     framework = config.get("framework", {})
     spatial = framework.get("spatial", {})
     stage = framework.get("training_stage", "full")
+    forcing = framework.get("spatial_forcing_aux", {})
+    bridge = config.get("datasets", {}).get("vla_data", {}).get("bridge_reasoning", {})
+    if bool(forcing.get("enable", False)):
+        required = {
+            "training_stage": stage == "full",
+            "disable_spatial": not spatial.get("enable", False),
+            "disable_spatial_teacher": not spatial.get("use_teacher", False),
+            "zero_spatial_loss": float(spatial.get("loss_weight", 0.0) or 0.0) == 0.0,
+            "disable_bridge_spatial": not bridge.get("include_spatial", False),
+            "zero_bridge_spatial_count": int(bridge.get("spatial_count", 0) or 0) == 0,
+            "disable_action_vggt": not framework.get("action_vggt_condition", {}).get("enable", False),
+            "input_size": int(forcing.get("input_size", 518)) == 518,
+            "target_tokens": int(forcing.get("target_tokens", 49)) == 49,
+            "student_layer": int(forcing.get("student_layer", 24)) == 24,
+            "teacher_layer": int(forcing.get("teacher_layer", -1)) == -1,
+            "patch_start_idx": int(forcing.get("patch_start_idx", 5)) == 5,
+            "pooling": forcing.get("pooling_func", "bilinear") == "bilinear",
+            "use_vggt_pe": bool(forcing.get("use_vggt_pe", True)),
+            "use_vlm_norm": bool(forcing.get("use_vlm_norm", True)),
+            "loss_weight": float(forcing.get("loss_weight", 0.0)) == 0.5,
+            "teacher_repo": bool(forcing.get("teacher_repo")),
+            "compute_language_loss": not framework.get("latent_reasoning", {}).get("compute_language_loss", False),
+            "vlm_loss_weight": float(framework.get("latent_reasoning", {}).get("vlm_loss_weight", 0.0)) == 0.0,
+            "img_next": not framework.get("img_next", {}).get("enable", False),
+            "latent_decoder": not framework.get("latent_decoder", {}).get("enable", False),
+            "freeze_modules": not config.get("trainer", {}).get("freeze_modules", ""),
+            "sdpa": framework.get("qwenvl", {}).get("attn_implementation", "sdpa") == "sdpa",
+        }
+        invalid = [name for name, valid in required.items() if not valid]
+        if invalid:
+            raise ValueError("Spatial Forcing configuration mismatch: " + ", ".join(invalid))
+        return
+    action_vggt = framework.get("action_vggt_condition", {})
+    if bool(action_vggt.get("enable", False)):
+        input_size = int(action_vggt.get("input_size", 518))
+        token_count = int(action_vggt.get("token_count", 0))
+        required = {
+            "training_stage": stage in {"action_only", "full"},
+            "disable_spatial": not spatial.get("enable", False),
+            "disable_spatial_teacher": not spatial.get("use_teacher", False),
+            "zero_spatial_loss": float(spatial.get("loss_weight", 0.0) or 0.0) == 0.0,
+            "disable_bridge_spatial": not bridge.get("include_spatial", False),
+            "zero_bridge_spatial_count": int(bridge.get("spatial_count", 0) or 0) == 0,
+            "input_size": input_size == 518,
+            "token_count": token_count == 1369 and token_count == (input_size // 14) ** 2,
+            "preprocess_mode": action_vggt.get("preprocess_mode", "resize") == "resize",
+            "teacher_layer": int(action_vggt.get("teacher_layer", -1)) == -1,
+            "patch_start_idx": int(action_vggt.get("patch_start_idx", 5)) == 5,
+            "no_extra_vggt_pe": not action_vggt.get("use_vggt_pe", False),
+            "teacher_repo": bool(action_vggt.get("teacher_repo")),
+            "compute_language_loss": not framework.get("latent_reasoning", {}).get("compute_language_loss", False),
+            "vlm_loss_weight": float(framework.get("latent_reasoning", {}).get("vlm_loss_weight", 0.0)) == 0.0,
+            "img_next": not framework.get("img_next", {}).get("enable", False),
+            "latent_decoder": not framework.get("latent_decoder", {}).get("enable", False),
+            "action_tokens": not bridge.get("include_action_tokens", False),
+            "bridge_img_next": not bridge.get("include_img_next", False),
+            "freeze_modules": not config.get("trainer", {}).get("freeze_modules", ""),
+            "sdpa": framework.get("qwenvl", {}).get("attn_implementation", "sdpa") == "sdpa",
+        }
+        invalid = [name for name, valid in required.items() if not valid]
+        if invalid:
+            raise ValueError("action VGGT configuration mismatch: " + ", ".join(invalid))
+        return
     mode = spatial.get("alignment_mode", "teacher_downsample")
     if stage != "spatial_only" and mode != "cross_attention":
         return
-    bridge = config.get("datasets", {}).get("vla_data", {}).get("bridge_reasoning", {})
     required = {
         "training_stage": stage in {"spatial_only", "full"},
         "alignment_mode": mode == "cross_attention",
