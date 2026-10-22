@@ -22,7 +22,7 @@ def validate_spatial_only_config(config) -> None:
             "zero_bridge_spatial_count": int(bridge.get("spatial_count", 0) or 0) == 0,
             "disable_action_vggt": not framework.get("action_vggt_condition", {}).get("enable", False),
             "input_size": int(forcing.get("input_size", 518)) == 518,
-            "target_tokens": int(forcing.get("target_tokens", 49)) == 49,
+            "target_tokens": int(forcing.get("target_tokens", 64)) == 64,
             "student_layer": int(forcing.get("student_layer", 24)) == 24,
             "teacher_layer": int(forcing.get("teacher_layer", -1)) == -1,
             "patch_start_idx": int(forcing.get("patch_start_idx", 5)) == 5,
