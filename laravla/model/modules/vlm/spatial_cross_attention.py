@@ -46,6 +46,8 @@ def validate_spatial_only_config(config) -> None:
     if bool(action_vggt.get("enable", False)):
         input_size = int(action_vggt.get("input_size", 518))
         token_count = int(action_vggt.get("token_count", 0))
+        max_patch_tokens = (input_size // 14) ** 2 if input_size > 0 and input_size % 14 == 0 else 0
+        token_side = math.isqrt(token_count) if token_count > 0 else 0
         required = {
             "training_stage": stage in {"action_only", "full"},
             "disable_spatial": not spatial.get("enable", False),
@@ -54,7 +56,7 @@ def validate_spatial_only_config(config) -> None:
             "disable_bridge_spatial": not bridge.get("include_spatial", False),
             "zero_bridge_spatial_count": int(bridge.get("spatial_count", 0) or 0) == 0,
             "input_size": input_size == 518,
-            "token_count": token_count == 1369 and token_count == (input_size // 14) ** 2,
+            "token_count": 0 < token_count <= max_patch_tokens and token_side * token_side == token_count,
             "preprocess_mode": action_vggt.get("preprocess_mode", "resize") == "resize",
             "teacher_layer": int(action_vggt.get("teacher_layer", -1)) == -1,
             "patch_start_idx": int(action_vggt.get("patch_start_idx", 5)) == 5,

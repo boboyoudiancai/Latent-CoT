@@ -137,10 +137,11 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             raise ValueError("action_vggt_condition.input_size must be a positive multiple of 14")
         expected_patch_tokens = (input_size // 14) ** 2
         token_count = int(action_vggt_cfg.get("token_count", expected_patch_tokens))
-        if token_count != expected_patch_tokens:
+        token_side = int(token_count ** 0.5)
+        if token_count <= 0 or token_count > expected_patch_tokens or token_side * token_side != token_count:
             raise ValueError(
-                "action_vggt_condition must keep every VGGT patch token: "
-                f"expected {expected_patch_tokens}, got {token_count}"
+                "action_vggt_condition.token_count must be a positive square no larger than the "
+                f"{expected_patch_tokens} VGGT patch tokens, got {token_count}"
             )
         if bool(action_vggt_cfg.get("use_vggt_pe", False)):
             raise ValueError("action_vggt_condition must use the original VGGT patch tokens without extra PE")
@@ -164,10 +165,18 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         self.action_vggt_teacher = teacher
         self.action_vggt_projector = projector
         self.action_vggt_token_count = token_count
-        logger.info(
-            "[action_vggt_condition] appending all %d VGGT patch tokens to action conditioning",
-            token_count,
-        )
+        if token_count == expected_patch_tokens:
+            logger.info(
+                "[action_vggt_condition] appending all %d VGGT patch tokens to action conditioning",
+                token_count,
+            )
+        else:
+            logger.info(
+                "[action_vggt_condition] bilinearly downsampling %d VGGT patch tokens to %d tokens and "
+                "appending them to action conditioning",
+                expected_patch_tokens,
+                token_count,
+            )
 
     def _append_action_vggt_condition(
         self,
