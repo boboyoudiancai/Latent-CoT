@@ -26,6 +26,7 @@ from laravla.model.modules.vlm.spatial_forcing_aux import (
     spatial_forcing_cosine_loss,
 )
 from laravla.model.modules.vlm.vggt_teacher import VGGTTeacher
+from laravla.model.modules.vlm.img_next_residual import masked_img_next_loss
 
 logger = initialize_overwatch(__name__)
 
@@ -158,6 +159,7 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 cache_only=bool(action_vggt_cfg.get("target_cache_only", False)),
                 view_mode="base_only",
                 expected_patch_tokens=expected_patch_tokens,
+                allow_token_pooling=True,
             )
         hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
         projector = torch.nn.Linear(int(teacher.embed_dim), hidden_size, bias=False)
@@ -634,6 +636,8 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         img_next_res = img_next_cfg.get("res", 112)
         img_next_teacher_type = str(img_next_cfg.get("teacher_type", "qwen")).strip().lower()
         img_next_target_frame = str(img_next_cfg.get("target_frame", "next")).strip().lower()
+        img_next_target_mode = str(img_next_cfg.get("target_mode", "absolute")).strip().lower()
+        img_next_loss_type = str(img_next_cfg.get("loss_type", "l1")).strip().lower()
         img_next_token_id = getattr(self.qwen_vl_interface, "img_next_token_id", None)
 
         use_img_next_teacher = img_next_cfg.get("use_teacher", True)
@@ -663,10 +667,13 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                     target_fallback,
                     target_res=img_next_res,
                     teacher_type=img_next_teacher_type,
+                    current_images=batch_images,
+                    target_mode=img_next_target_mode,
+                    loss_type=img_next_loss_type,
                 )
             except Exception as e:
-                if _is_vjepa21_teacher(img_next_teacher_type):
-                    raise RuntimeError("V-JEPA 2.1 target generation failed") from e
+                if _is_vjepa21_teacher(img_next_teacher_type) or img_next_target_mode == "residual_ema_rms":
+                    raise RuntimeError("ImageNext target generation failed") from e
                 logger.warning(f"[img_next_loss] skipped due to error: {e}")
                 img_next_loss = None
         
@@ -943,9 +950,12 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         fallback_mask: torch.Tensor,
         target_res: int = 112,
         teacher_type: str = "qwen",
+        current_images: Optional[List] = None,
+        target_mode: str = "absolute",
+        loss_type: str = "l1",
     ) -> Optional[torch.Tensor]:
         """
-        Compute L1 loss between ImageNext hidden states and configured visual targets.
+        Align ImageNext hidden states with absolute or normalized residual visual targets.
         """
         if last_hidden is None or target_images is None or len(target_images) == 0:
             return None
@@ -961,131 +971,156 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         try:
             # mask shape [B, L]; expect count per sample = img_next_count (16)
             B = last_hidden.shape[0]
-            img_next_count = img_next_mask.sum(dim=1).max().item()
+            token_counts = img_next_mask.sum(dim=1)
+            if not torch.all(token_counts == token_counts[0]):
+                raise ValueError(f"inconsistent ImageNext token counts: {token_counts.tolist()}")
+            img_next_count = int(token_counts[0].item())
             pred = last_hidden[img_next_mask].view(B, img_next_count, -1)
         except Exception as e:
             logger.warning(f"[img_next_loss] mask reshape failed: {e}")
             return None
 
         try:
-            # Use only the primary (first) view for img_next loss to match the single-view Bridge setup,
-            # while remaining compatible with single-view datasets (non-list entries).
-            flat_images = []
-            for sample_imgs in target_images:
-                if isinstance(sample_imgs, list):
-                    flat_images.append(sample_imgs[0] if len(sample_imgs) > 0 else None)
-                else:
-                    flat_images.append(sample_imgs)
-            
-            if len(flat_images) == 0:
-                logger.warning("[img_next_loss] no images to process")
+            target_feats = self._encode_img_next_target_features(
+                images=target_images,
+                target_res=target_res,
+                teacher_type=teacher_type,
+                target_tokens=img_next_count,
+                device=device,
+                dtype=dtype,
+            )
+            if target_feats is None:
                 return None
-
-            if _is_vjepa21_teacher(teacher_type):
-                with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    target_feats = self.qwen_vl_interface.get_external_img_next_target(
-                        images=flat_images,
-                        device=device,
-                        dtype=dtype,
-                        target_tokens=img_next_count,
-                    )
-                pred = self.qwen_vl_interface.project_img_next_prediction(pred)
-                if pred.shape != target_feats.shape:
-                    raise ValueError(
-                        "V-JEPA ImageNext shape mismatch: "
-                        f"prediction={tuple(pred.shape)} target={tuple(target_feats.shape)}"
-                    )
-            # Resize Qwen-teacher images before its processor to ensure `res` takes effect.
-            elif target_res is not None and int(target_res) > 0:
-                resized = []
-                for img in flat_images:
-                    try:
-                        resized.append(img.resize((int(target_res), int(target_res))))
-                    except Exception:
-                        resized.append(img)
-                flat_images = resized
-            
-           
-            if not _is_vjepa21_teacher(teacher_type):
-                proc = getattr(self.qwen_vl_interface, "processor", None)
-                if proc is None and hasattr(self.qwen_vl_interface, "model"):
-                    proc = getattr(self.qwen_vl_interface.model, "processor", None)
-                if proc is None:
-                    logger.warning("[img_next_loss] processor is None, skip img_next_loss")
+            normalized_target_mode = str(target_mode).strip().lower()
+            valid_samples = ~fallback_mask.to(device=device, dtype=torch.bool)
+            if normalized_target_mode == "residual_ema_rms":
+                if current_images is None:
+                    raise ValueError("residual_ema_rms ImageNext requires current_images")
+                current_feats = self._encode_img_next_target_features(
+                    images=current_images,
+                    target_res=target_res,
+                    teacher_type=teacher_type,
+                    target_tokens=img_next_count,
+                    device=device,
+                    dtype=dtype,
+                )
+                if current_feats is None:
                     return None
-                img_processor = getattr(proc, "image_processor", None)
-                if img_processor is None:
-                    logger.warning("[img_next_loss] processor.image_processor is None, skip img_next_loss")
-                    return None
-                with torch.no_grad():
-                    proc_out = img_processor(images=flat_images, return_tensors="pt")
-                    proc_out = dict(proc_out)
-                    pixel_values = proc_out.get("pixel_values", None)
-                    image_grid_thw = proc_out.get("image_grid_thw", None)
-                    if pixel_values is None:
-                        logger.warning("[img_next_loss] processor returned None pixel_values")
-                        return None
-                    pixel_values = pixel_values.to(device=device, dtype=dtype, non_blocking=True)
-                    if image_grid_thw is not None:
-                        image_grid_thw = image_grid_thw.to(device=device, non_blocking=True)
-
-                    main_model = getattr(self.qwen_vl_interface, "model", None)
-                    if main_model is None:
-                        logger.warning("[img_next_loss] main_model.get_image_features not available")
-                        return None
-                
-                    # Prefer EMA teacher vision encoder when available.
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        if hasattr(self.qwen_vl_interface, "get_image_features_target"):
-                            img_embeds, _ = self.qwen_vl_interface.get_image_features_target(
-                                pixel_values=pixel_values, image_grid_thw=image_grid_thw
-                            )
-                        else:
-                            if not hasattr(main_model, "get_image_features"):
-                                logger.warning("[img_next_loss] main_model.get_image_features not available")
-                                return None
-                            img_embeds, _ = main_model.get_image_features(
-                                pixel_values=pixel_values, image_grid_thw=image_grid_thw
-                            )
-                
-              
-                    if isinstance(img_embeds, (list, tuple)):
-                        feats = torch.stack([emb for emb in img_embeds], dim=0).to(device, dtype)
-                    else:
-                        feats = img_embeds.to(device, dtype)
-                
-                    if feats is None or feats.numel() == 0:
-                        logger.warning("[img_next_loss] extracted features are empty")
-                        return None
-                
-                    if feats.dim() == 2:
-                        feats = feats.unsqueeze(0)
-
-                    grid_side = int(feats.shape[1] ** 0.5)
-                    target_side = int(img_next_count ** 0.5)
-                    if grid_side * grid_side != feats.shape[1] or target_side * target_side != img_next_count:
-                        logger.warning(f"[img_next_loss] unexpected token grid: tokens={feats.shape[1]}, target={img_next_count}")
-                        return None
-
-                    feats_2d = feats.transpose(1, 2).reshape(feats.shape[0], feats.shape[2], grid_side, grid_side)
-                    feats_2d = F.adaptive_avg_pool2d(feats_2d, output_size=(target_side, target_side))
-                    target_feats = feats_2d.flatten(2).transpose(1, 2)  # [B, target_tokens, C]
+                target_feats = self.qwen_vl_interface.normalize_img_next_residual(
+                    (target_feats - current_feats).detach(),
+                    valid_samples,
+                ).detach()
+            elif normalized_target_mode != "absolute":
+                raise ValueError(f"unsupported ImageNext target_mode={target_mode!r}")
+            pred = self.qwen_vl_interface.project_img_next_prediction(pred)
         except Exception as e:
-            if _is_vjepa21_teacher(teacher_type):
+            if _is_vjepa21_teacher(teacher_type) or str(target_mode).strip().lower() == "residual_ema_rms":
                 raise
             logger.warning(f"[img_next_loss] visual encoding failed: {e}")
             return None
 
-        valid_mask = (~fallback_mask).float().view(-1, 1, 1)
-        if valid_mask.sum() <= 0:
-            # Keep the output connected to the graph so every DDP rank returns
-            # the same loss structure for episode-tail samples.
-            return pred.sum() * 0.0
+        return masked_img_next_loss(pred, target_feats, ~fallback_mask, loss_type)
 
-        l1 = torch.nn.functional.l1_loss(pred, target_feats, reduction="none")  # [B, tokens, C]
-        mask_full = valid_mask.expand_as(l1)
-        l1 = (l1 * mask_full).sum() / mask_full.sum()
-        return l1
+    def _encode_img_next_target_features(
+        self,
+        images: List,
+        target_res: int,
+        teacher_type: str,
+        target_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        flat_images = []
+        for sample_images in images:
+            if isinstance(sample_images, list):
+                flat_images.append(sample_images[0] if sample_images else None)
+            else:
+                flat_images.append(sample_images)
+        if not flat_images or any(image is None for image in flat_images):
+            logger.warning("[img_next_loss] missing image target")
+            return None
+        if _is_vjepa21_teacher(teacher_type):
+            with torch.no_grad(), torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                return self.qwen_vl_interface.get_external_img_next_target(
+                    images=flat_images,
+                    device=device,
+                    dtype=dtype,
+                    target_tokens=target_tokens,
+                )
+        if target_res is not None and int(target_res) > 0:
+            resized = []
+            for image in flat_images:
+                try:
+                    resized.append(image.resize((int(target_res), int(target_res))))
+                except Exception:
+                    resized.append(image)
+            flat_images = resized
+        processor = getattr(self.qwen_vl_interface, "processor", None)
+        if processor is None and hasattr(self.qwen_vl_interface, "model"):
+            processor = getattr(self.qwen_vl_interface.model, "processor", None)
+        image_processor = getattr(processor, "image_processor", None)
+        if image_processor is None:
+            logger.warning("[img_next_loss] image processor is unavailable")
+            return None
+        with torch.no_grad():
+            processor_output = dict(image_processor(images=flat_images, return_tensors="pt"))
+            pixel_values = processor_output.get("pixel_values")
+            image_grid_thw = processor_output.get("image_grid_thw")
+            if pixel_values is None:
+                logger.warning("[img_next_loss] processor returned no pixel_values")
+                return None
+            pixel_values = pixel_values.to(device=device, dtype=dtype, non_blocking=True)
+            if image_grid_thw is not None:
+                image_grid_thw = image_grid_thw.to(device=device, non_blocking=True)
+            main_model = getattr(self.qwen_vl_interface, "model", None)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=device.type == "cuda",
+            ):
+                if hasattr(self.qwen_vl_interface, "get_image_features_target"):
+                    image_embeddings, _ = self.qwen_vl_interface.get_image_features_target(
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                    )
+                elif main_model is not None and hasattr(main_model, "get_image_features"):
+                    image_embeddings, _ = main_model.get_image_features(
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                    )
+                else:
+                    logger.warning("[img_next_loss] image feature encoder is unavailable")
+                    return None
+        if isinstance(image_embeddings, (list, tuple)):
+            features = torch.stack([embedding for embedding in image_embeddings], dim=0)
+        else:
+            features = image_embeddings
+        if features is None or features.numel() == 0:
+            logger.warning("[img_next_loss] extracted features are empty")
+            return None
+        features = features.to(device=device, dtype=dtype)
+        if features.dim() == 2:
+            features = features.unsqueeze(0)
+        grid_side = int(features.shape[1] ** 0.5)
+        target_side = int(target_tokens ** 0.5)
+        if grid_side * grid_side != features.shape[1] or target_side * target_side != target_tokens:
+            logger.warning(
+                f"[img_next_loss] unexpected token grid: tokens={features.shape[1]}, "
+                f"target={target_tokens}"
+            )
+            return None
+        features_2d = features.transpose(1, 2).reshape(
+            features.shape[0],
+            features.shape[2],
+            grid_side,
+            grid_side,
+        )
+        features_2d = F.adaptive_avg_pool2d(features_2d, output_size=(target_side, target_side))
+        return features_2d.flatten(2).transpose(1, 2)
 
     def _limit_action_context(
         self,

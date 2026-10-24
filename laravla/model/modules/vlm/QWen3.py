@@ -18,6 +18,7 @@ from .spatial_cross_attention import (
     select_spatial_hidden,
     validate_spatial_only_config,
 )
+from .img_next_residual import EMARMSNormalizer, ImageNextPredictionMLP
 
 logger = initialize_overwatch(__name__)
 BASE_PROMPT = (
@@ -173,6 +174,35 @@ class _QWen3_VL_Interface(nn.Module):
         self.img_next_ema_momentum = 0.999
         self.visual_ema: Optional[nn.Module] = None
         self.img_next_target_projection: Optional[nn.Module] = None
+        self.img_next_target_mode = str(img_next_cfg.get("target_mode", "absolute")).strip().lower()
+        self.img_next_loss_type = str(img_next_cfg.get("loss_type", "l1")).strip().lower()
+        self.img_next_prediction_mlp: Optional[nn.Module] = None
+        self.img_next_residual_normalizer: Optional[nn.Module] = None
+        if self.img_next_target_mode not in {"absolute", "residual_ema_rms"}:
+            raise ValueError(
+                "framework.img_next.target_mode must be 'absolute' or 'residual_ema_rms', "
+                f"got {self.img_next_target_mode!r}"
+            )
+        if self.img_next_loss_type not in {"l1", "mae", "l2", "mse"}:
+            raise ValueError(
+                "framework.img_next.loss_type must be l1/mae/l2/mse, "
+                f"got {self.img_next_loss_type!r}"
+            )
+        if self.img_next_target_mode == "residual_ema_rms":
+            if self.img_next_teacher_type != "qwen":
+                raise ValueError("residual_ema_rms ImageNext currently requires teacher_type='qwen'")
+            if self.img_next_target_frame != "next":
+                raise ValueError("residual_ema_rms ImageNext requires target_frame='next'")
+            if self.img_next_loss_type not in {"l2", "mse"}:
+                raise ValueError("residual_ema_rms ImageNext requires loss_type='l2' or 'mse'")
+            hidden_size = int(self.model.config.text_config.hidden_size)
+            mlp_ratio = float(img_next_cfg.get("prediction_mlp_ratio", 2.0))
+            self.img_next_prediction_mlp = ImageNextPredictionMLP(hidden_size, mlp_ratio)
+            self.img_next_residual_normalizer = EMARMSNormalizer(
+                feature_dim=hidden_size,
+                decay=float(img_next_cfg.get("residual_ema_decay", 0.99)),
+                eps=float(img_next_cfg.get("residual_ema_eps", 1.0e-6)),
+            )
         # Deliberately not an nn.Module child: the external 300M teacher must not
         # enter the LaRA optimizer or be duplicated in every saved checkpoint.
         self.img_next_external_teacher = None
@@ -403,8 +433,21 @@ class _QWen3_VL_Interface(nn.Module):
         )
 
     def project_img_next_prediction(self, prediction: torch.Tensor) -> torch.Tensor:
+        prediction_mlp = getattr(self, "img_next_prediction_mlp", None)
+        if prediction_mlp is not None:
+            prediction = prediction_mlp(prediction)
         projection = getattr(self, "img_next_target_projection", None)
         return projection(prediction) if projection is not None else prediction
+
+    def normalize_img_next_residual(
+        self,
+        residual: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        normalizer = getattr(self, "img_next_residual_normalizer", None)
+        if normalizer is None:
+            return residual
+        return normalizer(residual, valid_mask, update=self.training)
 
     def get_external_img_next_target(
         self,

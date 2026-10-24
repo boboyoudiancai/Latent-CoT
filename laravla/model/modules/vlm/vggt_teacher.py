@@ -228,6 +228,7 @@ class VGGTTeacher:
         cache_only: bool = False,
         view_mode: str = "dual",
         expected_patch_tokens: int = None,
+        allow_token_pooling: bool = False,
     ) -> None:
         if not teacher_repo:
             raise ValueError("framework.spatial.teacher_repo must point to a local VGGT repository")
@@ -235,6 +236,7 @@ class VGGTTeacher:
         self.input_size = int(input_size)
         self.layer = int(layer)
         self.expected_patch_tokens = expected_patch_tokens
+        self.allow_token_pooling = bool(allow_token_pooling)
         self.patch_start_idx = int(patch_start_idx)
         self.use_vggt_pe = bool(use_vggt_pe)
         self.preprocess_mode = str(preprocess_mode)
@@ -455,12 +457,19 @@ class VGGTTeacher:
             raise ValueError(f"unsupported VGGT feature shape {tuple(features.shape)}")
         features = features[..., int(patch_start_idx):, :]
         if self.expected_patch_tokens is not None:
-            if features.shape[-2] != self.expected_patch_tokens or int(target_tokens) != self.expected_patch_tokens:
+            if features.shape[-2] != self.expected_patch_tokens:
                 raise ValueError(
-                    f"full-resolution VGGT alignment requires {self.expected_patch_tokens} patches, "
-                    f"got features={features.shape[-2]}, target_tokens={target_tokens}"
+                    f"VGGT extraction requires {self.expected_patch_tokens} source patches, "
+                    f"got {features.shape[-2]}"
                 )
-            if not self.use_vggt_pe:
+            if int(target_tokens) != self.expected_patch_tokens and not getattr(
+                self, "allow_token_pooling", False
+            ):
+                raise ValueError(
+                    f"full-resolution VGGT alignment requires {self.expected_patch_tokens} target patches, "
+                    f"got {target_tokens}"
+                )
+            if int(target_tokens) == self.expected_patch_tokens and not self.use_vggt_pe:
                 return features.detach()
         return pool_vggt_tokens(features, int(target_tokens), self.use_vggt_pe).detach()
 
