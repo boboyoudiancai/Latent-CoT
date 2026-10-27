@@ -836,6 +836,22 @@ class _QWen3_VL_Interface(nn.Module):
                 - 'num_reasoning_passes': number of iterative passes performed
         """
         return_latent_embeds = bool(kwargs.pop("return_latent_embeds", False))
+        return_hidden_layer = kwargs.pop("return_hidden_layer", None)
+        if return_hidden_layer is not None:
+            return_hidden_layer = int(return_hidden_layer)
+
+        def _select_hidden_layer(hidden_states):
+            if return_hidden_layer is None:
+                return None
+            layer_index = return_hidden_layer
+            if layer_index < 0:
+                layer_index += len(hidden_states)
+            if layer_index < 0 or layer_index >= len(hidden_states):
+                raise ValueError(
+                    f"return_hidden_layer={return_hidden_layer} is outside "
+                    f"the available range [-{len(hidden_states)}, {len(hidden_states) - 1}]"
+                )
+            return hidden_states[layer_index]
         B, T = input_ids.shape
         device = input_ids.device
         
@@ -923,6 +939,7 @@ class _QWen3_VL_Interface(nn.Module):
                 'loss': outputs.loss if labels is not None else None,
                 'logits': outputs.logits,
                 'hidden_states': outputs.hidden_states[-1],
+                'selected_hidden_states': _select_hidden_layer(outputs.hidden_states),
                 'latent_embeds': outputs.hidden_states[-1].new_zeros((B, 0, outputs.hidden_states[-1].shape[-1])),
                 'latent_attention_mask': torch.zeros((B, 0), dtype=torch.bool, device=device),
                 'num_reasoning_passes': 0,
@@ -939,6 +956,11 @@ class _QWen3_VL_Interface(nn.Module):
             (B, T, H), 
             dtype=inputs_embeds.dtype,
             device=device
+        )
+        selected_hidden_states = (
+            torch.zeros((B, T, H), dtype=inputs_embeds.dtype, device=device)
+            if return_hidden_layer is not None
+            else None
         )
         latent_embeds = torch.zeros(
             (B, max_n_latents, H),
@@ -1011,6 +1033,8 @@ class _QWen3_VL_Interface(nn.Module):
             
             # Fill hidden states into full tensor at corresponding positions
             full_hidden_states[:, s:e, :] = hidden_states
+            if selected_hidden_states is not None:
+                selected_hidden_states[:, s:e, :] = _select_hidden_layer(outputs.hidden_states)
             
             # Feedback: update thinking token embeddings with preceding hidden states
             # Since thinking tokens are consecutive, we update the thinking token at position (e) in this pass
@@ -1092,6 +1116,8 @@ class _QWen3_VL_Interface(nn.Module):
         
         # Fill the final segment of hidden states
         full_hidden_states[:, s:e, :] = outputs.hidden_states[-1]
+        if selected_hidden_states is not None:
+            selected_hidden_states[:, s:e, :] = _select_hidden_layer(outputs.hidden_states)
         
         # Return full hidden states [B, T, H] for action model's cross attention
         # Note: Gradient flows correctly through indexed assignment
@@ -1099,6 +1125,7 @@ class _QWen3_VL_Interface(nn.Module):
             'loss': outputs.loss if labels is not None else None,
             'logits': outputs.logits,
             'hidden_states': full_hidden_states,  # Complete sequence with all reasoning passes
+            'selected_hidden_states': selected_hidden_states,
             'latent_embeds': latent_embeds,
             'latent_attention_mask': latent_attention_mask,
             'num_reasoning_passes': max_n_latents + 1,

@@ -331,22 +331,31 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
         max_target_tokens: int = 128,
         loss_weight: float = 0.0,
         source_checkpoint: str = "",
+        trainable: bool = False,
     ) -> None:
-        """Attach Stage-1's auxiliary decoder without saving it in the VLA state dict."""
-        for parameter in decoder.parameters():
-            parameter.requires_grad_(False)
-        decoder.train()
-        if hasattr(decoder, "model"):
-            decoder.model.eval()
-        object.__setattr__(self, "_latent_decoder", decoder)
+        """Attach a frozen teacher decoder or a jointly trained decoder."""
+        if trainable:
+            for parameter in decoder.parameters():
+                parameter.requires_grad_(True)
+            decoder.train()
+            self._latent_decoder = decoder
+        else:
+            for parameter in decoder.parameters():
+                parameter.requires_grad_(False)
+            decoder.train()
+            if hasattr(decoder, "model"):
+                decoder.model.eval()
+            object.__setattr__(self, "_latent_decoder", decoder)
         object.__setattr__(self, "_latent_decoder_tokenizer", tokenizer)
         object.__setattr__(self, "_latent_decoder_component_order", tuple(component_order))
         object.__setattr__(self, "_latent_decoder_include_bbox", bool(include_bbox))
         object.__setattr__(self, "_latent_decoder_max_target_tokens", int(max_target_tokens))
         object.__setattr__(self, "_latent_decoder_loss_weight", float(loss_weight))
         object.__setattr__(self, "_latent_decoder_source_checkpoint", str(source_checkpoint))
+        object.__setattr__(self, "_latent_decoder_trainable", bool(trainable))
         logger.info(
-            "[latent_decoder] attached frozen decoder loss_weight=%s source=%s",
+            "[latent_decoder] attached trainable=%s loss_weight=%s source=%s",
+            trainable,
             loss_weight,
             source_checkpoint,
         )
@@ -549,10 +558,9 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
             enable_latent_reasoning
             and hasattr(self.qwen_vl_interface, "forward_latent")
         )
+        spatial_forcing_hidden = None
 
         if use_iterative_forward:
-            if self.spatial_forcing_enabled:
-                raise ValueError("spatial_forcing_aux requires the normal Qwen forward with hidden-state layers")
             # Step 2: Iterative forward with KV-Cache for implicit reasoning
             vlm_outputs = self.qwen_vl_interface.forward_latent(
                 input_ids=qwen_inputs["input_ids"],
@@ -562,9 +570,17 @@ class Qwen_GR00T(LatentAnalysisMixin, baseframework):
                 labels=qwen_inputs.get("labels"),  # May contain masked labels
                 position_ids=qwen_inputs.get("position_ids"),
                 return_latent_embeds=hasattr(self, "_latent_decoder"),
+                return_hidden_layer=(
+                    self.spatial_forcing_student_layer
+                    if self.spatial_forcing_enabled
+                    else None
+                ),
             )
             
             last_hidden = vlm_outputs['hidden_states']  # [B, L, H]
+            spatial_forcing_hidden = vlm_outputs.get('selected_hidden_states')
+            if self.spatial_forcing_enabled and spatial_forcing_hidden is None:
+                raise RuntimeError("iterative forward did not return the Spatial Forcing hidden layer")
             vlm_loss = vlm_outputs.get('loss')  # May be None if no labels
         else:
             # Step 2: Normal forward pass (no iterative reasoning)

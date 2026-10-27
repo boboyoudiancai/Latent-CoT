@@ -257,13 +257,17 @@ class M1Inference:
         elif (
             not self.enable_latent_reasoning
             and self.cot_mode == "none"
-            and self._include_spatial
+            and (self._include_spatial or self._include_img_next)
         ):
             spatial_span = self._spatial_span()
+            img_next_span = self._img_next_span()
             language_text = f"{prompt}."
             if self._spatial_query_mode == "visual_prefix_joint":
-                return f"{spatial_span} {language_text}".strip()
-            return f"{language_text} {spatial_span}".strip()
+                return " ".join(
+                    part for part in (spatial_span, language_text, img_next_span) if part
+                ).strip()
+            carrier_span = "".join(part for part in (img_next_span, spatial_span) if part)
+            return f"{language_text} {carrier_span}".strip() if carrier_span else language_text
         else:
             return prompt
 

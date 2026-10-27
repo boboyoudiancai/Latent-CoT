@@ -106,61 +106,119 @@ def build_model(cfg) -> torch.nn.Module:
 
 
 def attach_auxiliary_latent_decoder(model, cfg, device: torch.device) -> None:
-    """Load Stage-1's FullQwen latent decoder for a frozen auxiliary loss."""
+    """Attach a FullQwen latent decoder from a checkpoint or fresh base initialization."""
     decoder_cfg = cfg.framework.get("latent_decoder", {})
     if not bool(decoder_cfg.get("enable", False)):
         return
 
+    init_mode = str(decoder_cfg.get("init_mode", "checkpoint") or "checkpoint").strip().lower()
+    if init_mode not in {"checkpoint", "base"}:
+        raise ValueError(f"unsupported latent_decoder.init_mode={init_mode!r}")
+    decoder_backend = str(decoder_cfg.get("backend", "vlm") or "vlm").strip().lower()
+    if decoder_backend not in {"vlm", "causal_lm"}:
+        raise ValueError(f"unsupported latent_decoder.backend={decoder_backend!r}")
+    trainable = bool(decoder_cfg.get("trainable", False))
     checkpoint_path = str(decoder_cfg.get("checkpoint", "") or "").strip()
-    if not checkpoint_path:
+    if init_mode == "checkpoint" and not checkpoint_path:
         raise ValueError("framework.latent_decoder.checkpoint is required when enabled")
-    if not os.path.isfile(checkpoint_path):
+    if checkpoint_path and not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"latent decoder checkpoint not found: {checkpoint_path}")
 
     from decoder.latent_text_decoder import FullQwenLatentTextDecoder
-    from laravla.model.modules.vlm import get_vlm_model
+    if decoder_backend == "vlm":
+        from laravla.model.modules.vlm import get_vlm_model
 
-    decoder_cfg_full = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
-    decoder_base_vlm = str(
-        decoder_cfg.get("base_vlm", decoder_cfg_full.framework.qwenvl.base_vlm)
-    )
-    decoder_cfg_full.framework.qwenvl.base_vlm = decoder_base_vlm
-    decoder_cfg_full.framework.img_next.use_teacher = False
-    decoder_cfg_full.framework.spatial.use_teacher = False
+        decoder_cfg_full = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        decoder_model_path = str(
+            decoder_cfg.get("base_vlm", decoder_cfg_full.framework.qwenvl.base_vlm)
+        )
+        decoder_cfg_full.framework.qwenvl.base_vlm = decoder_model_path
+        decoder_cfg_full.framework.img_next.use_teacher = False
+        decoder_cfg_full.framework.spatial.use_teacher = False
+        decoder_iface = get_vlm_model(config=decoder_cfg_full)
+        decoder_qwen = decoder_iface.model
+        decoder_tokenizer = decoder_iface.processor.tokenizer
+    else:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    decoder_iface = get_vlm_model(config=decoder_cfg_full)
-    decoder_qwen = decoder_iface.model.to(device=device, dtype=torch.bfloat16)
+        decoder_model_path = str(
+            decoder_cfg.get("base_model", decoder_cfg.get("base_vlm", "")) or ""
+        ).strip()
+        if not decoder_model_path:
+            raise ValueError(
+                "framework.latent_decoder.base_model is required for backend='causal_lm'"
+            )
+        local_files_only = bool(decoder_cfg.get("local_files_only", True))
+        attn_implementation = str(
+            decoder_cfg.get("attn_implementation", "sdpa") or "sdpa"
+        ).strip()
+        decoder_qwen = AutoModelForCausalLM.from_pretrained(
+            decoder_model_path,
+            dtype=torch.bfloat16,
+            attn_implementation=attn_implementation,
+            local_files_only=local_files_only,
+            trust_remote_code=False,
+        )
+        decoder_tokenizer = AutoTokenizer.from_pretrained(
+            decoder_model_path,
+            local_files_only=local_files_only,
+            trust_remote_code=False,
+        )
+        if decoder_tokenizer.pad_token_id is None:
+            decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
+
+    decoder_qwen = decoder_qwen.to(device=device, dtype=torch.bfloat16)
     decoder_qwen.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
     if hasattr(decoder_qwen, "enable_input_require_grads"):
         decoder_qwen.enable_input_require_grads()
     decoder_qwen.config.use_cache = False
+    main_qwen = getattr(getattr(model, "qwen_vl_interface", None), "model", None)
+    main_hidden_size = getattr(getattr(main_qwen, "config", None), "hidden_size", None)
+    latent_hidden_size = int(
+        decoder_cfg.get("latent_hidden_size", main_hidden_size or decoder_qwen.config.hidden_size)
+    )
     decoder = FullQwenLatentTextDecoder(
         qwen_model=decoder_qwen,
         hidden_size=int(decoder_qwen.config.hidden_size),
         vocab_size=int(decoder_qwen.lm_head.out_features),
+        latent_hidden_size=latent_hidden_size,
     ).to(device=device, dtype=torch.bfloat16)
 
-    payload = torch.load(checkpoint_path, map_location="cpu")
-    decoder_state = payload.get("decoder_state_dict", payload)
-    decoder.load_state_dict(decoder_state, strict=True)
-    decoder.eval()
+    if init_mode == "checkpoint":
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        decoder_state = payload.get("decoder_state_dict", payload)
+        decoder.load_state_dict(decoder_state, strict=True)
+        initialization_source = checkpoint_path
+    else:
+        initialization_source = f"base:{decoder_backend}:{decoder_model_path}"
+    decoder.train(mode=trainable)
 
     bridge_cfg = cfg.datasets.vla_data.bridge_reasoning
     component_order = str(getattr(bridge_cfg, "component_order", "SUBTASK,BBOX,REASON"))
     component_order = [item.strip().upper() for item in component_order.split(",") if item.strip()]
     model.attach_latent_decoder(
         decoder=decoder,
-        tokenizer=decoder_iface.processor.tokenizer,
+        tokenizer=decoder_tokenizer,
         component_order=component_order,
         include_bbox=bool(getattr(bridge_cfg, "include_bbox", True)),
         max_target_tokens=int(decoder_cfg.get("max_target_tokens", 128)),
         loss_weight=float(decoder_cfg.get("loss_weight", 0.02)),
-        source_checkpoint=checkpoint_path,
+        source_checkpoint=initialization_source,
+        trainable=trainable,
     )
     if accelerator is not None and accelerator.is_main_process:
-        logger.info("[latent_decoder] loaded decoder checkpoint=%s", checkpoint_path)
+        logger.info(
+            "[latent_decoder] initialized mode=%s backend=%s trainable=%s "
+            "latent_hidden=%s decoder_hidden=%s source=%s",
+            init_mode,
+            decoder_backend,
+            trainable,
+            latent_hidden_size,
+            decoder_qwen.config.hidden_size,
+            initialization_source,
+        )
 
 
 # here changes need to 📦 encapsulate Dataloader
@@ -462,7 +520,23 @@ class LaRA_VLA_Trainer(TrainerUtils):
             checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
             # save model state
             state_dict = self.accelerator.get_state_dict(self.model)
-            torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+            decoder_prefix = "_latent_decoder."
+            decoder_state = {
+                key[len(decoder_prefix):]: value.detach().cpu()
+                for key, value in state_dict.items()
+                if key.startswith(decoder_prefix)
+            }
+            vla_state = {
+                key: value
+                for key, value in state_dict.items()
+                if not key.startswith(decoder_prefix)
+            }
+            torch.save(vla_state, checkpoint_path + "_pytorch_model.pt")
+            if decoder_state:
+                torch.save(
+                    {"step": self.completed_steps, "decoder_state_dict": decoder_state},
+                    checkpoint_path + "_decoder.pt",
+                )
 
             # save training metadata
             summary_data = {
@@ -788,6 +862,8 @@ class LaRA_VLA_Trainer(TrainerUtils):
 
         if "spatial_loss" in output_dict and output_dict["spatial_loss"] is not None:
             metrics["spatial_loss"] = output_dict["spatial_loss"].item()
+        if "spatial_forcing_loss" in output_dict and output_dict["spatial_forcing_loss"] is not None:
+            metrics["spatial_forcing_loss"] = output_dict["spatial_forcing_loss"].item()
         if "decoder_loss" in output_dict and output_dict["decoder_loss"] is not None:
             metrics["decoder_loss"] = output_dict["decoder_loss"].item()
         
@@ -804,7 +880,23 @@ class LaRA_VLA_Trainer(TrainerUtils):
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
             state_dict = self.accelerator.get_state_dict(self.model)
-            torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+            decoder_prefix = "_latent_decoder."
+            decoder_state = {
+                key[len(decoder_prefix):]: value.detach().cpu()
+                for key, value in state_dict.items()
+                if key.startswith(decoder_prefix)
+            }
+            vla_state = {
+                key: value
+                for key, value in state_dict.items()
+                if not key.startswith(decoder_prefix)
+            }
+            torch.save(vla_state, os.path.join(final_checkpoint, "pytorch_model.pt"))
+            if decoder_state:
+                torch.save(
+                    {"step": self.completed_steps, "decoder_state_dict": decoder_state},
+                    os.path.join(final_checkpoint, "decoder.pt"),
+                )
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         # close W&B

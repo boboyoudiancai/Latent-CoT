@@ -334,12 +334,29 @@ class FullQwenLatentTextDecoder(nn.Module):
         qwen_model: nn.Module,
         hidden_size: int,
         vocab_size: int,
+        latent_hidden_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.model = qwen_model
         self.hidden_size = int(hidden_size)
+        self.latent_hidden_size = int(latent_hidden_size or hidden_size)
         self.vocab_size = int(vocab_size)
         self.input_embeddings = self.model.get_input_embeddings()
+        if self.latent_hidden_size == self.hidden_size:
+            self.latent_input_projection = nn.Identity()
+        else:
+            self.latent_input_projection = nn.Sequential(
+                nn.LayerNorm(self.latent_hidden_size),
+                nn.Linear(self.latent_hidden_size, self.hidden_size),
+            )
+
+    def _project_latent_prefix(self, latent_prefix: torch.Tensor) -> torch.Tensor:
+        if latent_prefix.shape[-1] != self.latent_hidden_size:
+            raise ValueError(
+                f"latent hidden size {latent_prefix.shape[-1]} "
+                f"!= expected input size {self.latent_hidden_size}"
+            )
+        return self.latent_input_projection(latent_prefix)
 
     def forward(
         self,
@@ -360,9 +377,8 @@ class FullQwenLatentTextDecoder(nn.Module):
                 f"{tuple(target_input_ids.shape)}"
             )
 
-        batch_size, prefix_len, hidden_size = latent_prefix.shape
-        if hidden_size != self.hidden_size:
-            raise ValueError(f"latent hidden size {hidden_size} != decoder hidden size {self.hidden_size}")
+        batch_size, prefix_len, _ = latent_prefix.shape
+        latent_prefix = self._project_latent_prefix(latent_prefix)
 
         device = latent_prefix.device
         target_input_ids = target_input_ids.to(device=device)
@@ -540,6 +556,7 @@ class FullQwenLatentTextDecoder(nn.Module):
         generated_ids: torch.Tensor,
         latent_prefix_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        latent_prefix = self._project_latent_prefix(latent_prefix)
         if latent_prefix_attention_mask is None:
             latent_prefix_attention_mask = torch.ones(
                 latent_prefix.shape[:2],
