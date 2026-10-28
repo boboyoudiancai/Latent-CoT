@@ -168,11 +168,17 @@ def attach_auxiliary_latent_decoder(model, cfg, device: torch.device) -> None:
             decoder_tokenizer.pad_token = decoder_tokenizer.eos_token
 
     decoder_qwen = decoder_qwen.to(device=device, dtype=torch.bfloat16)
-    decoder_qwen.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
+    decoder_gradient_checkpointing = bool(
+        decoder_cfg.get("gradient_checkpointing", True)
     )
-    if hasattr(decoder_qwen, "enable_input_require_grads"):
-        decoder_qwen.enable_input_require_grads()
+    if decoder_gradient_checkpointing:
+        decoder_qwen.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        if hasattr(decoder_qwen, "enable_input_require_grads"):
+            decoder_qwen.enable_input_require_grads()
+    elif hasattr(decoder_qwen, "gradient_checkpointing_disable"):
+        decoder_qwen.gradient_checkpointing_disable()
     decoder_qwen.config.use_cache = False
     main_qwen = getattr(getattr(model, "qwen_vl_interface", None), "model", None)
     main_hidden_size = getattr(getattr(main_qwen, "config", None), "hidden_size", None)
@@ -184,6 +190,9 @@ def attach_auxiliary_latent_decoder(model, cfg, device: torch.device) -> None:
         hidden_size=int(decoder_qwen.config.hidden_size),
         vocab_size=int(decoder_qwen.lm_head.out_features),
         latent_hidden_size=latent_hidden_size,
+        micro_batch_size=int(decoder_cfg.get("micro_batch_size", 7)),
+        logit_row_chunk_size=int(decoder_cfg.get("logit_row_chunk_size", 64)),
+        use_forward_checkpoint=bool(decoder_cfg.get("use_forward_checkpoint", True)),
     ).to(device=device, dtype=torch.bfloat16)
 
     if init_mode == "checkpoint":
@@ -211,12 +220,19 @@ def attach_auxiliary_latent_decoder(model, cfg, device: torch.device) -> None:
     if accelerator is not None and accelerator.is_main_process:
         logger.info(
             "[latent_decoder] initialized mode=%s backend=%s trainable=%s "
-            "latent_hidden=%s decoder_hidden=%s source=%s",
+            "latent_hidden=%s decoder_hidden=%s micro_batch=%s "
+            "logit_row_chunk=%s forward_checkpoint=%s decoder_gradient_checkpointing=%s "
+            "attention=%s source=%s",
             init_mode,
             decoder_backend,
             trainable,
             latent_hidden_size,
             decoder_qwen.config.hidden_size,
+            decoder.micro_batch_size,
+            decoder.logit_row_chunk_size,
+            decoder.use_forward_checkpoint,
+            decoder_gradient_checkpointing,
+            attn_implementation if decoder_backend == "causal_lm" else "model_default",
             initialization_source,
         )
 

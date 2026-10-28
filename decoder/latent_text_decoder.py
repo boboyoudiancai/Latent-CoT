@@ -335,12 +335,24 @@ class FullQwenLatentTextDecoder(nn.Module):
         hidden_size: int,
         vocab_size: int,
         latent_hidden_size: Optional[int] = None,
+        micro_batch_size: int = 7,
+        logit_row_chunk_size: int = 64,
+        use_forward_checkpoint: bool = True,
     ) -> None:
         super().__init__()
+        if micro_batch_size <= 0:
+            raise ValueError(f"micro_batch_size must be positive, got {micro_batch_size}")
+        if logit_row_chunk_size <= 0:
+            raise ValueError(
+                f"logit_row_chunk_size must be positive, got {logit_row_chunk_size}"
+            )
         self.model = qwen_model
         self.hidden_size = int(hidden_size)
         self.latent_hidden_size = int(latent_hidden_size or hidden_size)
         self.vocab_size = int(vocab_size)
+        self.micro_batch_size = int(micro_batch_size)
+        self.logit_row_chunk_size = int(logit_row_chunk_size)
+        self.use_forward_checkpoint = bool(use_forward_checkpoint)
         self.input_embeddings = self.model.get_input_embeddings()
         if self.latent_hidden_size == self.hidden_size:
             self.latent_input_projection = nn.Identity()
@@ -403,7 +415,7 @@ class FullQwenLatentTextDecoder(nn.Module):
         target_lengths = target_attention_mask.long().sum(dim=1).clamp_min(1)
         sorted_indices = torch.argsort(target_lengths, descending=True)
         loss_sum = latent_prefix.new_zeros((), dtype=torch.float32)
-        micro_batch_size = 7
+        micro_batch_size = min(self.micro_batch_size, batch_size)
         for start in range(0, batch_size, micro_batch_size):
             end = min(start + micro_batch_size, batch_size)
             batch_indices = sorted_indices[start:end]
@@ -436,7 +448,7 @@ class FullQwenLatentTextDecoder(nn.Module):
                 valid_hidden = predictor_hidden[valid_mask]
                 valid_labels = labels[valid_mask]
                 chunk_loss_sum = predictor_hidden.new_zeros((), dtype=torch.float32)
-                logit_row_chunk_size = 64
+                logit_row_chunk_size = self.logit_row_chunk_size
                 for row_start in range(0, valid_hidden.shape[0], logit_row_chunk_size):
                     row_end = min(row_start + logit_row_chunk_size, valid_hidden.shape[0])
                     chunk_logits = self.model.lm_head(
@@ -449,7 +461,11 @@ class FullQwenLatentTextDecoder(nn.Module):
                     )
                 return chunk_loss_sum
 
-            if self.training and torch.is_grad_enabled():
+            if (
+                self.use_forward_checkpoint
+                and self.training
+                and torch.is_grad_enabled()
+            ):
                 loss_sum = loss_sum + checkpoint(
                     forward_chunk,
                     prefix_chunk,
