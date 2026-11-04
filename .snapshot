@@ -1,5 +1,5 @@
-date=20261104
-created_at=2026-11-04T03:00:50+08:00
+date=20261105
+created_at=2026-11-05T03:01:14+08:00
 source_branch=feat/spatial-cross-attention-stage1-20261019
 source_commit=3ed54bc761250d29e87eece2fd4818bf1b1fe5e3
-parent_snapshot=47a65e147daff3c43de2a135f3a75b18a98b2ba0
+parent_snapshot=231ec6c88ff2f09d3096ceef57df4e3c420be2de
