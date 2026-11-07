@@ -593,6 +593,7 @@ class LeRobotSingleDataset(Dataset):
         """
         # first check if the path directory exists
         self.data_cfg = data_cfg
+        self.include_future = bool(data_cfg.get("include_future", False)) if data_cfg is not None else False
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
         # indict letobot version
@@ -613,6 +614,15 @@ class LeRobotSingleDataset(Dataset):
 
         self._dataset_path = Path(dataset_path)
         self._dataset_name = self._dataset_path.name
+        self.thinking_annotations = None
+        if data_cfg is not None and bool(data_cfg.get("include_thinking_annotations", False)):
+            from starVLA.dataloader.gr00t_lerobot.bridge_annotations import BridgeAnnotations
+            ann_dir = self._dataset_path / "annotations"
+            cot_path = ann_dir / "episode_dense_captions_full.jsonl"
+            bbox_path = ann_dir / "episode_sam3_bboxes_from_dino_final.jsonl"
+            if not cot_path.is_file() or not bbox_path.is_file():
+                raise FileNotFoundError(f"Thinking supervision requires CoT and BBox files in {ann_dir}")
+            self.thinking_annotations = BridgeAnnotations(self._dataset_path, cot_path=cot_path, bbox_path=bbox_path)
         if isinstance(embodiment_tag, EmbodimentTag):
             self.tag = embodiment_tag.value
         else:
@@ -1374,9 +1384,16 @@ class LeRobotSingleDataset(Dataset):
         trajectory_id, base_index = self.all_steps[index]
         raw_data = self.get_step_data(trajectory_id, base_index)
         data = self.transforms(raw_data)
-        return self._pack_sample(data)
+        return self._pack_sample(data, trajectory_id, base_index)
 
-    def _pack_sample(self, data: dict) -> dict:
+    def _has_thinking_annotations(self, trajectory_id: int, base_index: int) -> bool:
+        if self.thinking_annotations is None:
+            return True
+        cot = self.thinking_annotations.get_step_cot(int(trajectory_id), int(base_index))
+        bbox = self.thinking_annotations.get_step_bbox(int(trajectory_id), int(base_index))
+        return bool(cot and cot.subtask and cot.reasoning and bbox and bbox.valid)
+
+    def _pack_sample(self, data: dict, trajectory_id=None, base_index=None) -> dict:
         """Pack transformed modality data into training sample format."""
         state_action_dtype = (
             self.data_cfg.get("state_action_dtype", "float16")
@@ -1399,10 +1416,23 @@ class LeRobotSingleDataset(Dataset):
                 raise ValueError(f"image_size must be an int or a 2-item sequence, got {image_size!r}")
 
         step_images = []
-        for video_key in self.modality_keys["video"]:
+        future_images = []
+        future_fallback = False
+        for view_index, video_key in enumerate(self.modality_keys["video"]):
             image = data[video_key][0]
             image = Image.fromarray(image).resize(image_size)
             step_images.append(image)
+            if self.include_future:
+                future_key = f"video_next.{video_key.replace('video.', '')}"
+                current_array = data[video_key][0]
+                if future_key in data:
+                    future_array = data[future_key][0]
+                else:
+                    future_array = current_array
+                    future_fallback = True
+                future_images.append(Image.fromarray(future_array).resize(image_size))
+                if view_index == 0 and np.array_equal(np.asarray(future_array), np.asarray(current_array)):
+                    future_fallback = True
 
         language = data[self.modality_keys["language"][0]][0]
         action = []
@@ -1416,6 +1446,22 @@ class LeRobotSingleDataset(Dataset):
             "lang": language,
             "robot_tag": self.tag
         }
+
+        if self.thinking_annotations is not None:
+            if trajectory_id is None or base_index is None or not self._has_thinking_annotations(trajectory_id, base_index):
+                raise ValueError(f"Missing complete thinking targets for episode={trajectory_id}, frame={base_index}")
+            cot = self.thinking_annotations.get_step_cot(int(trajectory_id), int(base_index))
+            bbox = self.thinking_annotations.get_step_bbox(int(trajectory_id), int(base_index))
+            bbox2 = self.thinking_annotations.get_step_bbox2(int(trajectory_id), int(base_index))
+            sample.update(cot_subtask=cot.subtask, cot_reasoning=cot.reasoning,
+                          bbox=bbox.bbox, bbox_valid=True,
+                          bbox2=bbox2.bbox if bbox2 and bbox2.valid else None,
+                          bbox2_valid=bool(bbox2 and bbox2.valid),
+                          episode_index=int(trajectory_id), frame_index=int(base_index))
+
+        if self.include_future:
+            sample["image_next"] = future_images
+            sample["image_next_fallback"] = future_fallback
 
         if self.data_cfg is not None and self.data_cfg.get("include_state", False) not in ["False", False]:
             state = []
@@ -1464,8 +1510,22 @@ class LeRobotSingleDataset(Dataset):
         data = {}
         # Get the data for all modalities # just for action base data
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        self.curr_traj_id = trajectory_id
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        trajectory_length = int(self.trajectory_lengths[trajectory_index])
         # TODO @JinhuiYE The logic below is poorly implemented. Data reading should be directly based on curr_traj_data.
         for modality in self.modality_keys:
+            if modality == "video" and self.include_future:
+                for key in self.modality_keys[modality]:
+                    next_index = min(base_index + 1, trajectory_length - 1)
+                    frames = self.get_video_by_step_indices(
+                        trajectory_id,
+                        key,
+                        np.asarray([base_index, next_index], dtype=np.int64),
+                    )
+                    data[key] = frames[:1]
+                    data[f"video_next.{key.replace('video.', '')}"] = frames[1:]
+                continue
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
@@ -1702,6 +1762,62 @@ class LeRobotSingleDataset(Dataset):
             video_path.as_posix(),
             video_timestamp,
             video_backend=self.video_backend, # TODO
+            video_backend_kwargs=self.video_backend_kwargs,
+        )
+
+    def get_video_by_step_indices(
+        self,
+        trajectory_id: int,
+        key: str,
+        step_indices: np.ndarray | list[int],
+    ) -> np.ndarray:
+        step_indices = np.asarray(step_indices, dtype=np.int64)
+        if self.curr_traj_id != trajectory_id or self.curr_traj_data is None:
+            self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+            self.curr_traj_id = trajectory_id
+
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        step_indices = np.clip(step_indices, 0, self.trajectory_lengths[trajectory_index] - 1)
+        assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
+        sub_key = key.replace("video.", "")
+        original_key = self.lerobot_modality_meta.video[sub_key].original_key
+        if original_key is None:
+            original_key = sub_key
+
+        if original_key in self.curr_traj_data.columns:
+            image_entries = self.curr_traj_data[original_key].tolist()
+
+            def decode_image_entry(entry):
+                if isinstance(entry, np.ndarray):
+                    return entry
+                if isinstance(entry, Image.Image):
+                    return np.array(entry)
+                if isinstance(entry, dict):
+                    image_bytes = entry.get("bytes")
+                    image_path = entry.get("path")
+                    if image_bytes is not None:
+                        return np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+                    if image_path is not None:
+                        resolved_path = Path(image_path)
+                        if not resolved_path.is_absolute():
+                            resolved_path = self.dataset_path / resolved_path
+                        return np.array(Image.open(resolved_path).convert("RGB"))
+                raise TypeError(f"Unsupported image entry type: {type(entry)}")
+
+            return np.stack([decode_image_entry(image_entries[int(index)]) for index in step_indices])
+
+        video_path = self.get_video_path(trajectory_id, sub_key)
+        if "timestamp" not in self.curr_traj_data.columns:
+            raise ValueError(f"No timestamp found in trajectory {trajectory_id}")
+        video_timestamp = self.curr_traj_data["timestamp"].to_numpy()[step_indices]
+        if self._lerobot_version == "v3.0":
+            episode_meta = self.trajectory_ids_to_metadata.get(trajectory_id, {})
+            from_timestamps = episode_meta.get("videos/from_timestamps", {})
+            video_timestamp = video_timestamp + float(from_timestamps.get(original_key, 0.0))
+        return get_frames_by_timestamps(
+            video_path.as_posix(),
+            video_timestamp,
+            video_backend=self.video_backend,
             video_backend_kwargs=self.video_backend_kwargs,
         )
 
@@ -2010,6 +2126,20 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         absolute_indices = self.start_indices[trajectory_index] + step_indices
         return self.cached_frames[key][absolute_indices]
 
+    def get_video_by_step_indices(
+        self,
+        trajectory_id: int,
+        key: str,
+        step_indices: np.ndarray | list[int],
+    ) -> np.ndarray:
+        step_indices = np.asarray(step_indices, dtype=np.int64)
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        step_indices = np.clip(step_indices, 0, self.trajectory_lengths[trajectory_index] - 1)
+        assert key.startswith("video."), f"Video key must start with 'video.', got {key}"
+        sub_key = key.replace("video.", "")
+        absolute_indices = self.start_indices[trajectory_index] + step_indices
+        return self.cached_frames[sub_key][absolute_indices]
+
     def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
         """Get the RAW data for a single step. No transforms are applied.
 
@@ -2022,8 +2152,22 @@ class CachedLeRobotSingleDataset(LeRobotSingleDataset):
         """
         data = {}
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        self.curr_traj_id = trajectory_id
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        trajectory_length = int(self.trajectory_lengths[trajectory_index])
         # Get the data for all modalities
         for modality in self.modality_keys:
+            if modality == "video" and self.include_future:
+                for key in self.modality_keys[modality]:
+                    next_index = min(base_index + 1, trajectory_length - 1)
+                    frames = self.get_video_by_step_indices(
+                        trajectory_id,
+                        key,
+                        np.asarray([base_index, next_index], dtype=np.int64),
+                    )
+                    data[key] = frames[:1]
+                    data[f"video_next.{key.replace('video.', '')}"] = frames[1:]
+                continue
             # Get the data corresponding to each key in the modality
             for key in self.modality_keys[modality]:
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
@@ -2225,11 +2369,16 @@ class LeRobotMixtureDataset(Dataset):
         self.seed = seed
         self.mode = mode
         self.data_cfg = kwargs["data_cfg"] if "data_cfg" in kwargs else None
+        self.sampling_mode = self.data_cfg.get("sampling_mode", "trajectory") if self.data_cfg is not None else "trajectory"
+        if self.sampling_mode not in {"trajectory", "lara_uniform_steps"}:
+            raise ValueError(f"Unsupported sampling_mode: {self.sampling_mode}")
         self.drop_incomplete_action_chunks = bool(
             self.data_cfg.get("drop_incomplete_action_chunks", False)
             if self.data_cfg is not None
             else False
         )
+        if self.sampling_mode == "lara_uniform_steps" and self.drop_incomplete_action_chunks:
+            raise ValueError("lara_uniform_steps is incompatible with drop_incomplete_action_chunks")
 
         self._valid_step_bounds: list[tuple[int, int]] = []
         self._effective_trajectory_lengths: list[np.ndarray] = []
@@ -2395,6 +2544,10 @@ class LeRobotMixtureDataset(Dataset):
         dataset_index = rng.choice(len(self.datasets), p=self.dataset_sampling_weights)
         dataset = self.datasets[dataset_index]
 
+        if self.sampling_mode == "lara_uniform_steps":
+            trajectory_id, base_index = dataset.all_steps[int(rng.choice(len(dataset.all_steps)))]
+            return dataset, trajectory_id, base_index
+
         # Sample trajectory
         trajectory_index = rng.choice(
             len(dataset.trajectory_ids), p=self.trajectory_sampling_weights[dataset_index]
@@ -2441,6 +2594,9 @@ class LeRobotMixtureDataset(Dataset):
                         )
 
                     dataset, trajectory_id, step = self.sample_step(index)
+                    if not dataset._has_thinking_annotations(trajectory_id, step):
+                        index = random.randint(0, len(self) - 1)
+                        continue
                     # If dataset has no physical videos (e.g., image frames in parquet
                     # for VLA-Arena), do not gate sampling on mp4 existence.
                     total_videos = int(dataset.lerobot_info_meta.get("total_videos", 0))
@@ -2455,7 +2611,7 @@ class LeRobotMixtureDataset(Dataset):
                     
                 raw_data = dataset.get_step_data(trajectory_id, step)    
                 data = dataset.transforms(raw_data)
-                sample = dataset._pack_sample(data)
+                sample = dataset._pack_sample(data, trajectory_id, step)
                 
                 return sample
                 

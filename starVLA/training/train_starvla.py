@@ -14,6 +14,8 @@ Conventions:
 import argparse
 import json
 import os
+import re
+import shutil
 import time
 from pathlib import Path
 from typing import Tuple
@@ -34,7 +36,7 @@ except ImportError:
 import wandb
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -48,7 +50,14 @@ from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, w
 from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
 
 deepspeed_plugin = None if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1" else DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
+gradient_accumulation_plugin = GradientAccumulationPlugin(
+    num_steps=int(os.environ.get("ACCELERATE_GRADIENT_ACCUMULATION_STEPS", "1")),
+    sync_each_batch=deepspeed_plugin is not None,
+)
+accelerator = Accelerator(
+    deepspeed_plugin=deepspeed_plugin,
+    gradient_accumulation_plugin=gradient_accumulation_plugin,
+)
 accelerator.print(accelerator.state)
 
 
@@ -59,10 +68,142 @@ def _unwrap_model(accelerator, model):
     return accelerator.unwrap_model(model)
 
 
-def _get_state_dict(accelerator, model):
-    if os.environ.get("STARVLA_DISABLE_DEEPSPEED") == "1":
-        return _unwrap_model(accelerator, model).state_dict()
-    return accelerator.get_state_dict(model)
+def _get_cpu_state_dict(accelerator, model):
+    """Copy parameters to CPU without gathering a second full GPU state dict.
+
+    ZeRO-2 keeps model parameters resident on every rank.  Calling
+    ``accelerator.get_state_dict`` while the training graph is also resident
+    can transiently allocate another full GPU state dict and OOM at checkpoint
+    time.  The main process instead copies each detached parameter directly to
+    CPU, where the resulting checkpoint is serialized.
+    """
+    module = _unwrap_model(accelerator, model)
+    return {
+        name: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+        for name, value in module.state_dict().items()
+    }
+
+
+def _atomic_save_state_dict(state_dict, checkpoint_path, save_format):
+    """Write a checkpoint atomically so interrupted saves are never resumable."""
+    temporary_path = checkpoint_path + ".tmp"
+    try:
+        if save_format == "safetensors":
+            from safetensors.torch import save_file
+
+            save_file(state_dict, temporary_path)
+        elif save_format == "pt":
+            torch.save(state_dict, temporary_path)
+        else:
+            raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+        os.replace(temporary_path, checkpoint_path)
+    except Exception:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+        raise
+
+
+def _validate_thinking_stage1_checkpoint(checkpoint_path):
+    """Reject an old pre-thinking model as a Stage 2 initialization."""
+    if str(checkpoint_path).endswith(".safetensors"):
+        from safetensors import safe_open
+        with safe_open(str(checkpoint_path), framework="pt", device="cpu") as checkpoint:
+            keys = list(checkpoint.keys())
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
+        keys = list(checkpoint.keys())
+        del checkpoint
+    if not any(key.startswith("latent_decoder.model.") for key in keys):
+        raise ValueError("Stage 2 initialization must be a full Stage 1 thinking checkpoint with decoder weights")
+
+
+def _thinking_stage1_module_names(model):
+    """Transfer the backbone plus the spatial projector only when it exists."""
+    modules = ["qwen_vl_interface"]
+    if getattr(model, "spatial_forcing_projector", None) is not None:
+        modules.append("spatial_forcing_projector")
+    return tuple(modules)
+
+
+def _load_thinking_stage1_modules(model, checkpoint_path):
+    """Strictly transfer Stage 1 features without the decoder or action head."""
+    _validate_thinking_stage1_checkpoint(checkpoint_path)
+    if str(checkpoint_path).endswith(".safetensors"):
+        from safetensors.torch import load_file
+        checkpoint = load_file(str(checkpoint_path), device="cpu")
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
+
+    modules = _thinking_stage1_module_names(model)
+    if "spatial_forcing_projector" not in modules and any(
+        key.startswith("spatial_forcing_projector.") for key in checkpoint
+    ):
+        raise ValueError("Spatial-disabled Stage 2 requires a spatial-disabled Stage 1 checkpoint")
+    states = {}
+    for name in modules:
+        module = getattr(model, name, None)
+        if module is None:
+            raise ValueError(f"Stage 2 model is missing required module {name}")
+        prefix = name + "."
+        state = {key[len(prefix):]: value for key, value in checkpoint.items() if key.startswith(prefix)}
+        expected = module.state_dict()
+        missing, unexpected = set(expected) - set(state), set(state) - set(expected)
+        wrong_shapes = [key for key in set(expected) & set(state) if expected[key].shape != state[key].shape]
+        if not state or missing or unexpected or wrong_shapes:
+            raise ValueError(
+                f"Incompatible Stage 1 module {name}: missing={sorted(missing)[:5]}, "
+                f"unexpected={sorted(unexpected)[:5]}, shape_mismatch={sorted(wrong_shapes)[:5]}"
+            )
+        states[name] = state
+    # Validate every module before changing any, and leave the action head untouched.
+    for name in modules:
+        getattr(model, name).load_state_dict(states[name], strict=True)
+    return model
+
+
+def _validate_thinking_accumulation(cfg, accelerator):
+    latent_cfg = cfg.framework.get("latent_reasoning", {})
+    if bool(latent_cfg.get("enable", False)):
+        configured = int(cfg.trainer.gradient_accumulation_steps)
+        actual = int(accelerator.gradient_accumulation_steps)
+        if configured != actual:
+            raise ValueError(
+                f"Thinking training requires actual gradient accumulation to match config: "
+                f"configured={configured}, accelerator={actual}. Use the provided launcher."
+            )
+
+
+def _prune_completed_training_states(checkpoint_dir, keep_last, completed_steps):
+    """Keep recent optimizer states within this run; never prune weight files or links."""
+    if keep_last is None:
+        return []
+    if isinstance(keep_last, bool) or int(keep_last) != keep_last or keep_last < 2:
+        raise ValueError("trainer.keep_last_training_states must be an integer >= 2")
+    root = Path(checkpoint_dir).resolve(strict=True)
+    candidates = []
+    for entry in root.iterdir():
+        match = re.fullmatch(r"steps_(\d+)_training_state", entry.name)
+        if not match or entry.is_symlink() or not entry.is_dir():
+            continue
+        step = int(match.group(1))
+        metadata = entry / "trainer_state.json"
+        if step > completed_steps or not metadata.is_file() or metadata.is_symlink():
+            continue
+        with metadata.open(encoding="utf-8") as handle:
+            if json.load(handle).get("completed_steps") != step:
+                raise ValueError(f"Checkpoint retention metadata mismatch: {entry}")
+        candidates.append((step, entry))
+    candidates.sort(key=lambda row: row[0])
+    if not any(step == completed_steps for step, _ in candidates):
+        raise ValueError("Checkpoint retention requires the newly completed state")
+    removed = []
+    for _, entry in candidates[:-int(keep_last)]:
+        target = entry.resolve(strict=True)
+        if target.parent != root or target != entry or entry.is_symlink():
+            raise ValueError(f"Unsafe checkpoint retention target: {entry}")
+        shutil.rmtree(target)
+        removed.append(str(target))
+    return removed
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -107,7 +248,7 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
         betas=tuple(cfg.trainer.optimizer.betas),
         weight_decay=cfg.trainer.optimizer.weight_decay,
         eps=cfg.trainer.optimizer.eps,
-        fused=True,
+        fused=bool(cfg.trainer.optimizer.get("fused", True)),
     )
 
     if dist.is_initialized() and dist.get_rank() == 0:
@@ -116,11 +257,12 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
     # Strip keys unknown to transformers' get_scheduler before passing kwargs.
     sched_kwargs = {k: v for k, v in cfg.trainer.scheduler_specific_kwargs.items()}
+    scheduler_scale = accelerator.num_processes if cfg.trainer.get("scale_scheduler_by_world_size", False) else 1
     lr_scheduler = get_scheduler(
         name=cfg.trainer.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=cfg.trainer.num_warmup_steps,
-        num_training_steps=cfg.trainer.max_train_steps,
+        num_warmup_steps=cfg.trainer.num_warmup_steps * scheduler_scale,
+        num_training_steps=cfg.trainer.max_train_steps * scheduler_scale,
         scheduler_specific_kwargs=sched_kwargs,
     )
 
@@ -137,6 +279,12 @@ class VLATrainer(TrainerUtils):
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self._future_ema_updates = 0
+        self.data_batches_consumed = 0
+        self.vla_epoch_count = 0
+        self._batches_in_current_epoch = 0
+        self._resume_state_dir = None
+        self._resume_metadata = None
         self.total_batch_size = self._calculate_total_batch_size()
 
     def prepare_training(self):
@@ -150,7 +298,7 @@ class VLATrainer(TrainerUtils):
         self._save_initial_configs()
 
         self._init_checkpointing()
-        self._adjust_lr_scheduler_for_resume()
+        self._future_ema_updates = self.completed_steps
 
         freeze_modules = (
             self.config.trainer.freeze_modules
@@ -158,14 +306,34 @@ class VLATrainer(TrainerUtils):
             else None
         )
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
+        # Hugging Face from_pretrained() returns nested models in eval mode.
+        # Explicitly activate training before DeepSpeed wraps the model.
+        self.model.train()
         self.print_trainable_parameters(self.model)
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
+        self.model, self.optimizer, self.vla_train_dataloader, self.lr_scheduler = self.setup_distributed_training(
             self.accelerator,
             self.model,
             self.optimizer,
             self.vla_train_dataloader,
+            self.lr_scheduler,
         )
+
+        latent_cfg = self.config.framework.get("latent_reasoning", {})
+        ds_accumulation = getattr(self.model, "gradient_accumulation_steps", None)
+        if bool(latent_cfg.get("enable", False)) and callable(ds_accumulation):
+            actual_ds_steps = int(ds_accumulation())
+            if actual_ds_steps != int(self.accelerator.gradient_accumulation_steps):
+                raise ValueError(
+                    f"DeepSpeed gradient accumulation {actual_ds_steps} does not match "
+                    f"Accelerate {self.accelerator.gradient_accumulation_steps}"
+                )
+
+        # Preserve the old explicit behaviour for an opt-in legacy
+        # weights-only continuation.  Strict resume restores the scheduler's
+        # serialized state later, after positioning the dataloader.
+        if self.resume_from_checkpoint and not self._resume_state_dir and self.completed_steps > 0:
+            self._adjust_lr_scheduler_for_weights_only_resume()
 
         self._init_wandb()
 
@@ -227,30 +395,82 @@ class VLATrainer(TrainerUtils):
             logger.info(f"📊 Accessed config snapshot saved at {output_dir / 'config.yaml'}")
 
     def _init_checkpointing(self):
-        """Initialize checkpoint directory and handle checkpoint loading."""
+        """Resolve the checkpoint to restore before distributed wrapping.
+
+        A strict resume uses an Accelerate state directory, not a standalone
+        model file.  The actual ``load_state`` call must happen only after
+        model, optimizer, dataloader, and scheduler have been prepared.
+        """
         self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
         is_resume = getattr(self.config.trainer, "is_resume", False)
-        self.resume_from_checkpoint = pretrained_checkpoint
+        latent_cfg = self.config.framework.get("latent_reasoning", {})
+        if (bool(latent_cfg.get("require_base_initialization", False))
+                and pretrained_checkpoint and not is_resume):
+            raise ValueError("This thinking experiment must start from base pretrained VLM weights, not a training checkpoint")
+        if (bool(latent_cfg.get("require_stage1_checkpoint", False))
+                and not pretrained_checkpoint and not is_resume):
+            raise ValueError("Stage 2 requires trainer.pretrained_checkpoint to point to a completed Stage 1 checkpoint")
+        if bool(latent_cfg.get("require_stage1_checkpoint", False)) and pretrained_checkpoint and not is_resume:
+            _validate_thinking_stage1_checkpoint(pretrained_checkpoint)
+        resume_mode = str(getattr(self.config.trainer, "resume_mode", "strict"))
+        if resume_mode not in {"strict", "weights_only"}:
+            raise ValueError("trainer.resume_mode must be 'strict' or 'weights_only'")
+        self.resume_from_checkpoint = None
 
         if is_resume:
+            if resume_mode == "strict":
+                resume_from_checkpoint, self.completed_steps = self._get_latest_training_state(self.checkpoint_dir)
+                if not resume_from_checkpoint:
+                    raise RuntimeError(
+                        "Strict resume requested, but no complete training-state checkpoint was found. "
+                        "Legacy *_pytorch_model.pt files contain weights only and cannot restore AdamW, "
+                        "scheduler, RNG, or dataloader position. Use trainer.resume_mode=weights_only "
+                        "only when non-equivalent continuation is acceptable."
+                    )
+                self._resume_state_dir = resume_from_checkpoint
+                self._resume_metadata = self._read_resume_metadata(resume_from_checkpoint)
+                logger.info(
+                    "Strict resume selected: state=%s, steps=%d",
+                    self._resume_state_dir,
+                    self.completed_steps,
+                )
+                return
+
             resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
                 self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
-                logger.info(
-                    f"Resuming training from checkpoint: {self.resume_from_checkpoint}, steps: {self.completed_steps}"
+                logger.warning(
+                    "Weights-only resume selected: optimizer/RNG/dataloader state is intentionally not restored. "
+                    "checkpoint=%s steps=%d",
+                    self.resume_from_checkpoint,
+                    self.completed_steps,
                 )
                 return
-
             logger.warning(f"No valid checkpoint found in {self.checkpoint_dir}. Starting training from scratch.")
             self.completed_steps = 0
+            if bool(latent_cfg.get("require_stage1_checkpoint", False)) and not pretrained_checkpoint:
+                raise ValueError("No Stage 2 resume checkpoint found and no Stage 1 checkpoint was provided")
 
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
-            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            if bool(latent_cfg.get("require_stage1_checkpoint", False)):
+                selected = {name.strip() for name in str(reload_modules or "").split(",") if name.strip()}
+                expected_modules = set(_thinking_stage1_module_names(self.model))
+                if selected != expected_modules:
+                    raise ValueError(f"Stage 2 must reload only {sorted(expected_modules)}")
+                self.model = _load_thinking_stage1_modules(self.model, pretrained_checkpoint)
+            else:
+                self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            latent_cfg = self.config.framework.get("latent_reasoning", {})
+            if bool(latent_cfg.get("initialize_tokens_from_base_checkpoint", False)):
+                if int(latent_cfg.get("stage", 0)) != 1:
+                    raise ValueError("initialize_tokens_from_base_checkpoint is only valid for Stage 1")
+                self.model.qwen_vl_interface._initialize_thinking_token_rows()
+                logger.info("Initialized thinking-token rows after loading the pre-thinking checkpoint")
             self.completed_steps = 0
             self.resume_from_checkpoint = pretrained_checkpoint
             logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
@@ -258,48 +478,115 @@ class VLATrainer(TrainerUtils):
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
 
-    def _adjust_lr_scheduler_for_resume(self):
-        """Adjust LR scheduler state after resuming from non-zero steps."""
-        if self.completed_steps > 0:
-            logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
-            for _ in range(self.completed_steps):
-                self.lr_scheduler.step()
-            logger.info(
-                f"LR scheduler adjusted to step {self.completed_steps}, current LR: {self.lr_scheduler.get_last_lr()}"
-            )
+    def _get_latest_training_state(self, checkpoint_dir):
+        """Return the latest atomically-published full training state."""
+        candidates = []
+        for entry in Path(checkpoint_dir).iterdir():
+            match = re.fullmatch(r"steps_(\d+)_training_state", entry.name)
+            if not match or not entry.is_dir():
+                continue
+            if not (entry / "trainer_state.json").is_file():
+                continue
+            candidates.append((int(match.group(1)), entry))
+        if not candidates:
+            return None, 0
+        completed_steps, state_dir = max(candidates, key=lambda item: item[0])
+        return str(state_dir), completed_steps
 
-    def _load_checkpoint(self, checkpoint_path):
-        """Load checkpoint."""
-        self.accelerator.load_state(checkpoint_path)
-        self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+    @staticmethod
+    def _read_resume_metadata(state_dir):
+        metadata_path = Path(state_dir) / "trainer_state.json"
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        required = {"completed_steps", "data_batches_consumed", "vla_epoch_count", "batches_in_current_epoch"}
+        missing = sorted(required.difference(metadata))
+        if missing:
+            raise RuntimeError(f"Incomplete strict-resume metadata in {metadata_path}: missing {missing}")
+        return metadata
+
+    def _restore_training_state(self):
+        """Restore prepared model/optimizer/scheduler/RNG after data positioning."""
+        if not self._resume_state_dir:
+            return
+        saved_world_size = int(self._resume_metadata.get("world_size", -1))
+        saved_accumulation = int(self._resume_metadata.get("gradient_accumulation_steps", -1))
+        if saved_world_size != self.accelerator.num_processes:
+            raise RuntimeError(
+                f"Strict resume requires the same world size: checkpoint={saved_world_size}, "
+                f"current={self.accelerator.num_processes}"
+            )
+        if saved_accumulation != self.accelerator.gradient_accumulation_steps:
+            raise RuntimeError(
+                "Strict resume requires the same gradient accumulation steps: "
+                f"checkpoint={saved_accumulation}, current={self.accelerator.gradient_accumulation_steps}"
+            )
+        self.accelerator.load_state(self._resume_state_dir)
+        self.accelerator.print(f"Strictly resumed from training state: {self._resume_state_dir}")
+
+    def _adjust_lr_scheduler_for_weights_only_resume(self):
+        """Retain historical LR behaviour for explicitly non-strict continuation."""
+        logger.warning("Advancing scheduler for weights-only resume from step %d", self.completed_steps)
+        for _ in range(self.completed_steps):
+            self.lr_scheduler.step()
 
     def _save_checkpoint(self):
-        """Save current training state."""
+        """Save an inference model plus an atomically-published full training state."""
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
-            state_dict = _get_state_dict(self.accelerator, self.model)
+            state_dict = _get_cpu_state_dict(self.accelerator, self.model)
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, checkpoint_path + "_model.safetensors")
+                checkpoint_file = checkpoint_path + "_model.safetensors"
             elif save_format == "pt":
-                torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+                checkpoint_file = checkpoint_path + "_pytorch_model.pt"
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            _atomic_save_state_dict(state_dict, checkpoint_file, save_format)
+        self.accelerator.wait_for_everyone()
 
-            summary_data = {"steps": self.completed_steps}
+        state_dir = Path(f"{checkpoint_path}_training_state")
+        temporary_state_dir = Path(f"{state_dir}.incomplete")
+        if self.accelerator.is_main_process:
+            if state_dir.exists():
+                raise FileExistsError(f"Refusing to overwrite existing full training state: {state_dir}")
+            if temporary_state_dir.exists():
+                shutil.rmtree(temporary_state_dir)
+        self.accelerator.wait_for_everyone()
+
+        self.accelerator.save_state(str(temporary_state_dir))
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
+            metadata = {
+                "completed_steps": self.completed_steps,
+                "data_batches_consumed": self.data_batches_consumed,
+                "vla_epoch_count": self.vla_epoch_count,
+                "batches_in_current_epoch": self._batches_in_current_epoch,
+                "world_size": self.accelerator.num_processes,
+                "gradient_accumulation_steps": self.accelerator.gradient_accumulation_steps,
+            }
+            with (temporary_state_dir / "trainer_state.json").open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, sort_keys=True)
+            os.replace(temporary_state_dir, state_dir)
+
+            summary_data = {"steps": self.completed_steps, "full_training_state": str(state_dir)}
             with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
                 f.write(json.dumps(summary_data) + "\n")
-            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}")
+            self.accelerator.print(f"✅ Checkpoint saved at {checkpoint_path}; strict state={state_dir}")
+            removed = _prune_completed_training_states(
+                self.checkpoint_dir,
+                self.config.trainer.get("keep_last_training_states", None),
+                self.completed_steps,
+            )
+            if removed:
+                logger.info("Removed older optimizer states (model weights retained): %s", removed)
 
             if isinstance(self.config, AccessTrackedConfig):
                 logger.info("📊 Saving accessed configuration...")
                 output_dir = Path(self.config.output_dir)
                 self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
                 logger.info("✅ Configuration files saved")
-
         self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
@@ -320,21 +607,48 @@ class VLATrainer(TrainerUtils):
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
 
     def _create_data_iterators(self):
-        """Create data iterators."""
+        """Create data iterators, restoring the next unread batch on strict resume."""
+        if self._resume_metadata is not None:
+            self.data_batches_consumed = int(self._resume_metadata["data_batches_consumed"])
+            self.vla_epoch_count = int(self._resume_metadata["vla_epoch_count"])
+            self._batches_in_current_epoch = int(self._resume_metadata["batches_in_current_epoch"])
+            self._set_dataloader_epoch(self.vla_epoch_count)
         self.vla_iter = iter(self.vla_train_dataloader)
+
+        # The dataset used here deterministically derives a sample from
+        # (epoch, index).  Advance only the iterator position before loading
+        # RNG state so preprocessing cannot perturb the restored training RNG.
+        for _ in range(self._batches_in_current_epoch):
+            try:
+                next(self.vla_iter)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "Strict-resume data position exceeds the restored dataloader epoch; "
+                    "the dataset or world-size changed since checkpointing."
+                ) from exc
+
+        self._restore_training_state()
+
+    def _set_dataloader_epoch(self, epoch: int) -> None:
+        sampler = getattr(self.vla_train_dataloader, "sampler", None)
+        if sampler is not None and callable(getattr(sampler, "set_epoch", None)):
+            sampler.set_epoch(epoch)
+        dataset = getattr(self.vla_train_dataloader, "dataset", None)
+        if dataset is not None and callable(getattr(dataset, "set_epoch", None)):
+            dataset.set_epoch(epoch)
 
     def _get_next_batch(self):
         """Get next batch (automatically handle data loop)."""
         try:
             batch_vla = next(self.vla_iter)
         except StopIteration:
-            if not hasattr(self, "vla_epoch_count"):
-                self.vla_epoch_count = 0
-            self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
-                self.vla_train_dataloader, self.vla_epoch_count
-            )
+            self.vla_epoch_count += 1
+            self._batches_in_current_epoch = 0
+            self._set_dataloader_epoch(self.vla_epoch_count)
+            self.vla_iter = iter(self.vla_train_dataloader)
             batch_vla = next(self.vla_iter)
-
+        self.data_batches_consumed += 1
+        self._batches_in_current_epoch += 1
         return batch_vla
 
     def train(self):
@@ -356,9 +670,11 @@ class VLATrainer(TrainerUtils):
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
 
-            if self.accelerator.sync_gradients:
-                progress_bar.update(1)
-                self.completed_steps += 1
+            if not self.accelerator.sync_gradients:
+                continue
+
+            progress_bar.update(1)
+            self.completed_steps += 1
 
             if self.accelerator.is_local_main_process:
                 progress_bar.set_postfix(
@@ -375,7 +691,7 @@ class VLATrainer(TrainerUtils):
             step_metrics["timing/model"] = t_end_model - t_start_model
             self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if self.completed_steps % self.config.trainer.save_interval == 0:
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -387,9 +703,14 @@ class VLATrainer(TrainerUtils):
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
-        output_dict = _unwrap_model(self.accelerator, self.model).predict_action(
-            examples=examples, use_ddim=True, num_ddim_steps=20
-        )
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            output_dict = _unwrap_model(self.accelerator, self.model).predict_action(
+                examples=examples, use_ddim=True, num_ddim_steps=20
+            )
+        finally:
+            self.model.train(was_training)
 
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
@@ -415,16 +736,14 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 output_dict = self.model.forward(batch_vla)
                 action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                total_loss = output_dict.get("total_loss", action_loss)
 
             self.accelerator.backward(total_loss)
 
-            if self.config.trainer.gradient_clipping is not None:
+            if self.accelerator.sync_gradients and self.config.trainer.gradient_clipping is not None:
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
 
             self.optimizer.step()
@@ -435,10 +754,25 @@ class VLATrainer(TrainerUtils):
             # at min_lr well before max_train_steps is reached.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+                self._future_ema_updates += 1
+                if self._future_ema_updates % 2 == 0:
+                    unwrapped_model = _unwrap_model(self.accelerator, self.model)
+                    qwen_interface = getattr(unwrapped_model, "qwen_vl_interface", None)
+                    if qwen_interface is not None and hasattr(qwen_interface, "update_future_ema"):
+                        qwen_interface.update_future_ema()
+            self.optimizer.zero_grad()
 
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+        metrics = {"total_loss": total_loss.item()}
+        if (output_dict.get("decoder_loss") is None
+                or int(self.config.framework.get("latent_reasoning", {}).get("stage", 0)) != 1):
+            metrics["action_dit_loss"] = action_loss.item()
+        if output_dict.get("future_loss") is not None:
+            metrics["future_loss"] = output_dict["future_loss"].item()
+        if output_dict.get("spatial_forcing_loss") is not None:
+            metrics["spatial_forcing_loss"] = output_dict["spatial_forcing_loss"].item()
+        if output_dict.get("decoder_loss") is not None:
+            metrics["decoder_loss"] = output_dict["decoder_loss"].item()
+        return metrics
 
     def _finalize_training(self):
         """Training end processing."""
@@ -446,15 +780,14 @@ class VLATrainer(TrainerUtils):
             save_format = getattr(self.config.trainer, "save_format", "pt")
             final_checkpoint = os.path.join(self.config.output_dir, "final_model")
             os.makedirs(final_checkpoint, exist_ok=True)
-            state_dict = _get_state_dict(self.accelerator, self.model)
+            state_dict = _get_cpu_state_dict(self.accelerator, self.model)
             if save_format == "safetensors":
-                from safetensors.torch import save_file
-
-                save_file(state_dict, os.path.join(final_checkpoint, "model.safetensors"))
+                checkpoint_file = os.path.join(final_checkpoint, "model.safetensors")
             elif save_format == "pt":
-                torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+                checkpoint_file = os.path.join(final_checkpoint, "pytorch_model.pt")
             else:
                 raise ValueError(f"Unsupported save_format `{save_format}`. Expected `pt` or `safetensors`.")
+            _atomic_save_state_dict(state_dict, checkpoint_file, save_format)
             logger.info(f"Training complete. Final model saved at {final_checkpoint}")
 
         if self.accelerator.is_main_process and getattr(self, "_wandb_enabled", False):
@@ -471,6 +804,12 @@ def main(cfg) -> None:
 
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
+
+    _validate_thinking_accumulation(cfg, accelerator)
+
+    from starVLA.model.modules.vlm.thinking_config import validate_stage2_decoder_config
+
+    validate_stage2_decoder_config(cfg)
 
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)

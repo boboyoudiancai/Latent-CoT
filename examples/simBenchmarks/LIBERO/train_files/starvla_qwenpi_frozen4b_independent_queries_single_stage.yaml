@@ -1,0 +1,126 @@
+# Same frozen-4B experiment; only latent forward mode and output run_id differ.
+run_id: qwenpi_frozen4b_projector_independent_queries_single_stage_40k
+run_root_dir: playground/Checkpoints
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starvla_frozen4b_decoder_libero
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenPI_v3
+  qwenvl:
+    base_vlm: /share/home/u25505/apps/wangbo/LatentVLA/LaRA-VLA/playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action
+    attn_implementation: sdpa
+    num_vl_layers: 36
+  future:
+    enable: false
+    loss_weight: 0.0
+    use_teacher: false
+  latent_reasoning:
+    enable: true
+    stage: 2
+    token_count: 3
+    forward_mode: independent_queries
+    require_base_initialization: true
+    require_stage1_checkpoint: false
+    stage2_decoder_supervision: true
+    freeze_decoder: true
+    decoder_input_projector: residual_mlp
+    decoder_base_vlm: ${framework.qwenvl.base_vlm}
+    decoder_local_files_only: true
+    decoder_micro_batch_size: 7
+    decoder_logit_row_chunk_size: 64
+    decoder_use_forward_checkpoint: true
+    decoder_loss_weight: 0.1
+    max_target_tokens: 128
+  spatial_forcing_aux:
+    enable: false
+    loss_weight: 0.0
+  action_model:
+    action_model_type: LayerwiseFM
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 8
+    repeated_diffusion_steps: 4
+    num_inference_timesteps: 4
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_target_vision_tokens: 32
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    diffusion_model_cfg:
+      action_dit_hidden_dim: 1024
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: false
+      norm_type: ada_norm
+      positional_embeddings: null
+      attention_head_dim: 64
+
+datasets:
+  vlm_data:
+    dataset_py: vlm_datasets
+    dataformat: llava_json
+    dataset_use: sharegpt4v_coco
+    data_flatten: false
+    eval_dataset: sharegpt4v_coco
+    base_interval: 2
+    max_pixels: 307200
+    min_pixels: 784
+    model_max_length: 2048
+    model_type: qwen3vl
+    per_device_batch_size: 4
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /share/home/u25505/apps/wangbo/starVLA/playground/Checkpoints/starvla_qwenpiv3_future_libero_direct_stage2_40k_20261029/data_overlay/libero_cot_primary_alias
+    data_mix: libero_all
+    action_type: delta_qpos
+    include_state: false
+    include_future: false
+    include_thinking_annotations: true
+    sampling_mode: lara_uniform_steps
+    per_device_batch_size: 14
+    load_all_data_for_training: true
+    image_size: [224, 224]
+    obs_image_size: [224, 224]
+    video_backend: torchvision_av
+
+trainer:
+  keep_last_training_states: 2
+  is_resume: false
+  resume_mode: strict
+  pretrained_checkpoint: null
+  reload_modules: null
+  max_train_steps: 40000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  eval_interval: 2000
+  learning_rate:
+    base: 3.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+    project_layers: 1.0e-04
+    latent_decoder.latent_input_projection: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+    vlm: 0.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  scale_scheduler_by_world_size: true
+  gradient_checkpointing: false
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  repeated_diffusion_steps: 4
